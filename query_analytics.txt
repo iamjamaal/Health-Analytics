@@ -1,0 +1,238 @@
+### Question 1: Monthly Encounters by Specialty
+
+SELECT 
+    s.specialty_name,
+    DATE_FORMAT(e.encounter_date, '%Y-%m') AS month,
+    e.encounter_type,
+    COUNT(DISTINCT e.encounter_id) AS total_encounters,
+    COUNT(DISTINCT e.patient_id) AS unique_patients
+FROM encounters e
+INNER JOIN providers p ON e.provider_id = p.provider_id
+INNER JOIN specialties s ON p.specialty_id = s.specialty_id
+WHERE e.encounter_date >= '2024-01-01' 
+    AND e.encounter_date < '2025-01-01'
+GROUP BY 
+    s.specialty_name,
+    DATE_FORMAT(e.encounter_date, '%Y-%m'),
+    e.encounter_type
+ORDER BY 
+    month DESC,
+    s.specialty_name,
+    e.encounter_type;
+
+
+
+## Performance Analysis:
+
+# Schema Analysis:
+- Tables joined: encounters, providers, specialties
+- Number of joins: 2
+- Join path: encounters → providers → specialties
+- Additional operations: DATE_FORMAT function, GROUP BY with 3 columns, COUNT DISTINCT
+
+# Performance Metrics:
+- Execution time: ~0.063 seconds (with 10,000 records)
+- Estimated rows scanned: ~10,000 (encounters) + ~50 (providers) + ~10 (specialties)
+- Rows returned: ~360 (assuming 10 specialties × 12 months × 3 encounter types)
+- encounter types: ER, Inpatient, Outpatient
+
+
+# Bottlenecks Identified:
+1. JOIN Chain Performance: Two sequential JOINs required to connect encounters to specialties through providers
+2. DATE_FORMAT Overhead: Repeated function calls on encounter_date for every row during grouping
+3. No Date Dimension: Cannot leverage pre-computed time hierarchies (year, month, quarter)
+4. COUNT DISTINCT Cost: Expensive operation on large datasets, especially for patient_id
+5. Repeated Dimension Lookups: Same specialty names retrieved thousands of times
+
+Root Cause:
+Normalization forces expensive JOIN operations and prevents pre-aggregation. Date calculations happen at query time rather than using a date dimension table.
+
+
+
+
+
+### Question 2: Top Diagnosis-Procedure Pairs
+SELECT 
+    d.icd10_code,
+    d.icd10_description,
+    pr.cpt_code,
+    pr.cpt_description,
+    COUNT(DISTINCT ed.encounter_id) AS encounter_count
+FROM encounter_diagnoses ed
+INNER JOIN diagnoses d ON ed.diagnosis_id = d.diagnosis_id
+INNER JOIN encounter_procedures ep ON ed.encounter_id = ep.encounter_id
+INNER JOIN procedures pr ON ep.procedure_id = pr.procedure_id
+WHERE ed.diagnosis_sequence = 1  -- Primary diagnosis only
+GROUP BY 
+    d.icd10_code,
+    d.icd10_description,
+    pr.cpt_code,
+    pr.cpt_description
+ORDER BY encounter_count DESC
+LIMIT 20;
+
+
+
+## Performance Analysis:
+QUESTION 2: Top Diagnosis-Procedure Pairs
+
+Schema Analysis:
+- Tables joined: encounter_diagnoses, diagnoses, encounter_procedures, procedures
+- Number of joins: 3
+- Join path: encounter_diagnoses → diagnoses
+                                  → encounter_procedures → procedures
+- Junction table interaction: Two junction tables joined on encounter_id
+
+Performance Metrics:
+- Execution time: ~0.172 seconds (with 10,000 encounters)
+- Estimated rows scanned: 
+   encounter_diagnoses: ~20,000 rows (2 diagnoses per encounter avg)
+   encounter_procedures: ~25,000 rows (2.5 procedures per encounter avg)
+   Cartesian product potential: Very high before filtering
+- Rows returned: 20
+
+Bottlenecks Identified:
+1. Junction Table Explosion: Joining two junction tables on encounter_id creates a many-to-many relationship
+   - If an encounter has 3 diagnoses and 3 procedures, this creates 9 intermediate rows
+2. Cartesian Product Risk: Without proper indexing, can create massive intermediate result sets
+3. Multiple Lookups: Each diagnosis and procedure code requires lookup in master tables
+4. GROUP BY on Text Fields: Grouping on description fields (VARCHAR) is slower than numeric keys
+5. Lack of Pre-computed Combinations: No materialized view of common diagnosis-procedure pairs
+
+Root Cause:
+Many-to-many relationships through junction tables cause row explosion. Each encounter with N diagnoses and M procedures creates N×M intermediate rows before aggregation. This is the "row explosion" problem classic to normalized schemas.
+
+
+
+
+### Question 3: 30-Day Readmission Rate by Specialty
+WITH inpatient_encounters AS (
+    SELECT 
+        e.encounter_id,
+        e.patient_id,
+        e.provider_id,
+        e.discharge_date,
+        p.specialty_id
+    FROM encounters e
+    INNER JOIN providers p ON e.provider_id = p.provider_id
+    WHERE e.encounter_type = 'Inpatient'
+        AND e.discharge_date IS NOT NULL
+),
+readmissions AS (
+    SELECT 
+        ie1.specialty_id,
+        ie1.encounter_id AS original_encounter_id,
+        ie2.encounter_id AS readmit_encounter_id,
+        ie1.patient_id,
+        ie1.discharge_date AS original_discharge,
+        ie2.encounter_date AS readmit_date,
+        DATEDIFF(ie2.encounter_date, ie1.discharge_date) AS days_to_readmit
+    FROM inpatient_encounters ie1
+    INNER JOIN encounters ie2 
+        ON ie1.patient_id = ie2.patient_id
+        AND ie2.encounter_type = 'Inpatient'
+        AND ie2.encounter_date > ie1.discharge_date
+        AND ie2.encounter_date <= DATE_ADD(ie1.discharge_date, INTERVAL 30 DAY)
+    WHERE ie1.encounter_id != ie2.encounter_id
+)
+SELECT 
+    s.specialty_name,
+    COUNT(DISTINCT ie.encounter_id) AS total_discharges,
+    COUNT(DISTINCT r.original_encounter_id) AS readmissions,
+    ROUND(
+        (COUNT(DISTINCT r.original_encounter_id) * 100.0) / 
+        NULLIF(COUNT(DISTINCT ie.encounter_id), 0), 
+        2
+    ) AS readmission_rate_pct
+FROM inpatient_encounters ie
+INNER JOIN specialties s ON ie.specialty_id = s.specialty_id
+LEFT JOIN readmissions r ON ie.encounter_id = r.original_encounter_id
+GROUP BY s.specialty_name
+ORDER BY readmission_rate_pct DESC;
+
+
+
+## Performance Analysis:
+QUESTION 3: 30-Day Readmission Rate by Specialty
+
+Schema Analysis:
+- Tables joined: encounters (self-join), providers, specialties
+- Number of joins: 4 (including self-join)
+- Join type: Self-join on encounters table
+- CTEs used: 2 (inpatient_encounters, readmissions)
+
+Performance Metrics:
+- Execution time: ~1.2 seconds (with 10,000 encounters)
+- Estimated rows scanned:
+   First CTE: ~3,300 inpatient encounters
+   Self-join: 3,300 × 10,000 = 33 million comparisons (before filtering)
+   After date filtering: ~500,000 row comparisons
+- Rows returned: ~10 (one per specialty)
+
+Bottlenecks Identified:
+1. Self-Join on Large Table: Encounters table joined to itself creates exponential comparison overhead
+2. Date Range Calculations: DATEDIFF and DATE_ADD functions evaluated for every row combination
+3. No Temporal Indexing: encounter_date index exists but complex date logic limits effectiveness
+4. Multiple Scans: Encounters table scanned 3 times (CTE1, CTE2, final join)
+5. Complex Subquery Logic: CTEs create temporary result sets that must be materialized
+6. Patient-Level Join: Joining on patient_id without adequate indexing
+
+Root Cause:
+Self-joins on fact tables are extremely expensive. In a normalized schema, there's no way to pre-compute readmission flags or time-to-readmit metrics. Every query must recalculate these from raw encounter dates. The O(N²) comparison complexity makes this scale poorly.
+
+
+
+
+
+### Question 4: Revenue by Specialty and Month
+SELECT 
+    s.specialty_name,
+    DATE_FORMAT(e.encounter_date, '%Y-%m') AS month,
+    COUNT(DISTINCT e.encounter_id) AS encounter_count,
+    SUM(b.claim_amount) AS total_claimed,
+    SUM(b.allowed_amount) AS total_allowed,
+    ROUND(AVG(b.allowed_amount), 2) AS avg_allowed_per_encounter,
+    ROUND(
+        (SUM(b.allowed_amount) / NULLIF(SUM(b.claim_amount), 0)) * 100, 
+        2
+    ) AS allowed_rate_pct
+FROM encounters e
+INNER JOIN providers p ON e.provider_id = p.provider_id
+INNER JOIN specialties s ON p.specialty_id = s.specialty_id
+INNER JOIN billing b ON e.encounter_id = b.encounter_id
+WHERE e.encounter_date >= '2024-01-01' 
+    AND e.encounter_date < '2025-01-01'
+    AND b.claim_status IN ('Paid', 'Processing')
+GROUP BY 
+    s.specialty_name,
+    DATE_FORMAT(e.encounter_date, '%Y-%m')
+ORDER BY 
+    month DESC,
+    total_allowed DESC;
+
+
+## Performance Analysis:
+QUESTION 4: Revenue by Specialty & Month
+Schema Analysis:
+- Tables joined: encounters, providers, specialties, billing
+- Number of joins: 3
+- Join path: encounters → providers → specialties
+                        → billing
+- Join types: All INNER JOINs
+
+Performance Metrics:
+- Execution time: ~0.25 seconds (with 10,000 records)
+- Estimated rows scanned: ~10,000 (encounters) + ~50 (providers) + ~10 (specialties) + ~10,000 (billing)
+- Index usage: idx_encounter_date helps, but multiple JOINs still required
+- Rows returned: ~120 (10 specialties × 12 months)
+
+Bottlenecks Identified:
+1. Multiple JOIN Chain: Three-table JOIN path (encounters → providers → specialties)
+2. Date Aggregation: DATE_FORMAT applied to every row during GROUP BY
+3. Financial Calculations: Multiple SUM and AVG aggregations computed at query time
+4. No Pre-Aggregation: All revenue metrics calculated from scratch for every query
+5. Repeated Dimension Lookups: Specialty names retrieved for every encounter
+6. DECIMAL Precision: Financial calculations with DECIMAL(12,2) are CPU-intensive
+
+Root Cause:
+Normalization separates financial data (billing) from context (specialty via encounters→providers). Every financial report requires expensive JOINs to add context. No summary tables exist for common time-period aggregations (monthly, quarterly revenue).
