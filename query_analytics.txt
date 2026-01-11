@@ -48,7 +48,7 @@ Root Cause:
 Normalization forces expensive JOIN operations and prevents pre-aggregation. Date calculations happen at query time rather than using a date dimension table.
 
 
-
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 
 ### Question 2: Top Diagnosis-Procedure Pairs
@@ -103,6 +103,7 @@ Root Cause:
 Many-to-many relationships through junction tables cause row explosion. Each encounter with N diagnoses and M procedures creates N×M intermediate rows before aggregation. This is the "row explosion" problem classic to normalized schemas.
 
 
+.............................................................................................................................................................................................................................................
 
 
 ### Question 3: 30-Day Readmission Rate by Specialty
@@ -180,7 +181,7 @@ Bottlenecks Identified:
 Root Cause:
 Self-joins on fact tables are extremely expensive. In a normalized schema, there's no way to pre-compute readmission flags or time-to-readmit metrics. Every query must recalculate these from raw encounter dates. The O(N²) comparison complexity makes this scale poorly.
 
-
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 
 
@@ -236,3 +237,4 @@ Bottlenecks Identified:
 
 Root Cause:
 Normalization separates financial data (billing) from context (specialty via encounters→providers). Every financial report requires expensive JOINs to add context. No summary tables exist for common time-period aggregations (monthly, quarterly revenue).
+git commit -m "Add query analytics documentation"git commit -m "Add query analytics documentation"
