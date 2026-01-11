@@ -1,0 +1,295 @@
+HEALTHCARE ANALYTICS STAR SCHEMA
+DESIGN DECISIONS DOCUMENT
+
+
+### DECISION 1: Fact Table Grain
+----------------------------
+CHOSEN: Option A - One row per encounter
+
+JUSTIFICATION:
+- Encounter is the natural business transaction in healthcare
+- All 4 business questions aggregate at the encounter level
+- Allows capturing both diagnosis and procedure counts as measures
+- Simplifies queries - avoid complex bridge table joins for most analytics
+- Better performance for trend analysis and encounter-based metrics
+
+WHY NOT Option B (one row per diagnosis):
+- Would create 2-3x more rows (multiple diagnoses per encounter)
+- Revenue metrics would need complex aggregation to avoid double-counting
+- Encounter-level metrics (readmissions, length of stay) become harder
+
+WHY NOT Option C (one row per procedure):
+- Would create 2-4x more rows (multiple procedures per encounter)
+- Same revenue double-counting issues
+- Even more complex for encounter-level analysis
+
+GRAIN DEFINITION:
+One fact table row represents a single patient encounter (visit), capturing:
+- When it happened (date/time)
+- Who was involved (patient, provider)
+- Where it occurred (department)
+- What type (outpatient/inpatient/ER)
+- Financial outcomes (billing amounts)
+- Clinical summary (diagnosis count, procedure count)
+
+---------------------------------------------------------------------------------------------
+
+
+
+### DECISION 2: Dimension Tables
+----------------------------
+
+1. 
+DIM_DATE (Date Dimension)
+- date_key (PK, INT, surrogate key in YYYYMMDD format)
+- calendar_date (DATE, actual date)
+- year (INT)
+- quarter (INT, 1-4)
+- month (INT, 1-12)
+- month_name (VARCHAR, 'January', 'February', etc.)
+- week_of_year (INT, 1-53)
+- day_of_month (INT, 1-31)
+- day_of_week (INT, 1-7, Monday=1)
+- day_name (VARCHAR, 'Monday', 'Tuesday', etc.)
+- is_weekend (BOOLEAN)
+- is_holiday (BOOLEAN)
+- fiscal_year (INT)
+- fiscal_quarter (INT)
+
+RATIONALE:
+- Pre-compute all date attributes to eliminate DATE_FORMAT at query time
+- Enable fast filtering and grouping by any time hierarchy
+- Support both calendar and fiscal year reporting
+- Critical for time-series analysis and trending
+
+
+2. 
+DIM_PATIENT (Patient Dimension - Type 1 SCD)
+- patient_key (PK, INT, surrogate key)
+- patient_id (INT, business key from OLTP)
+- mrn (VARCHAR, medical record number)
+- full_name (VARCHAR, concatenated first + last)
+- date_of_birth (DATE)
+- age (INT, calculated from DOB)
+- age_group (VARCHAR, '0-17', '18-35', '36-50', '51-65', '66+')
+- gender (CHAR)
+- gender_description (VARCHAR, 'Male', 'Female', 'Unknown')
+
+RATIONALE:
+- Type 1 SCD (overwrite changes) - patient demographics update rarely
+- Pre-compute age and age groups for demographic analysis
+- Denormalize full name for reporting simplicity
+- Keep MRN for integration with clinical systems
+
+
+3.
+DIM_PROVIDER (Provider Dimension - Type 1 SCD)
+- provider_key (PK, INT, surrogate key)
+- provider_id (INT, business key)
+- full_name (VARCHAR, concatenated first + last)
+- credential (VARCHAR, 'MD', 'DO', 'NP', 'PA')
+- specialty_id (INT, foreign key to dim_specialty)
+- specialty_name (VARCHAR, denormalized for query convenience)
+- department_id (INT, foreign key to dim_department)
+- department_name (VARCHAR, denormalized for query convenience)
+
+RATIONALE:
+- Denormalize specialty and department names directly into provider dimension
+- Eliminates additional JOINs for most provider-based queries
+- Still maintain foreign keys for drill-down capabilities
+- Type 1 SCD - provider attributes change infrequently
+
+
+4.
+DIM_SPECIALTY (Specialty Dimension)
+- specialty_key (PK, INT, surrogate key)
+- specialty_id (INT, business key)
+- specialty_name (VARCHAR)
+- specialty_code (VARCHAR)
+- specialty_category (VARCHAR, 'Surgical', 'Medical', 'Diagnostic', etc.)
+
+RATIONALE:
+- Small dimension (~10-20 rows)
+- Enables specialty-based analysis without joining through providers
+- Adds specialty categorization for higher-level grouping
+
+
+5.
+DIM_DEPARTMENT (Department Dimension)
+- department_key (PK, INT, surrogate key)
+- department_id (INT, business key)
+- department_name (VARCHAR)
+- floor (INT)
+- capacity (INT)
+- department_type (VARCHAR, 'Clinical', 'Surgical', 'Diagnostic', etc.)
+
+RATIONALE:
+- Small dimension (~10-15 rows)
+- Physical facility attributes for capacity planning
+- Department categorization for operational reporting
+
+
+
+6.
+DIM_ENCOUNTER_TYPE (Encounter Type Dimension - Junk Dimension)
+- encounter_type_key (PK, INT, surrogate key)
+- encounter_type (VARCHAR, 'Inpatient', 'Outpatient', 'ER')
+- encounter_type_category (VARCHAR, 'Acute', 'Ambulatory', 'Emergency')
+- expected_duration_hours (INT, typical length)
+- is_admission (BOOLEAN)
+- is_same_day (BOOLEAN)
+
+RATIONALE:
+- Junk dimension for low-cardinality categorical attribute
+- Adds business rules about encounter types
+- Enables consistent encounter type analysis
+
+--------------------------------------------------------------------------------------------
+
+
+
+### DECISION 3: Pre-Aggregated Metrics in Fact Table
+-------------------------------------------------
+
+MEASURES TO STORE:
+1. diagnosis_count (INT)
+   - Count of diagnoses assigned to this encounter
+   - Avoids JOIN to encounter_diagnoses for simple counting
+   
+2. procedure_count (INT)
+   - Count of procedures performed during encounter
+   - Avoids JOIN to encounter_procedures for simple counting
+
+3. primary_diagnosis_key (INT)
+   - Foreign key to bridge_diagnoses for the primary diagnosis
+   - Enables quick filtering on most important diagnosis
+
+4. claim_amount (DECIMAL(12,2))
+   - Total billed amount
+   - Direct from billing table
+
+5. allowed_amount (DECIMAL(12,2))
+   - Total allowed/paid amount
+   - Direct from billing table
+
+6. length_of_stay_hours (INT)
+   - Difference between encounter_date and discharge_date in hours
+   - Critical metric for inpatient analysis
+   - Expensive to calculate at query time
+
+7. is_readmission_30day (BOOLEAN)
+   - Flag indicating if this encounter is a 30-day readmission
+   - Pre-computed during ETL using self-join logic
+   - Eliminates expensive self-join from Question 3
+
+8. days_since_last_encounter (INT)
+   - Days between this encounter and previous for same patient
+   - Supports readmission and frequency analysis
+   - NULL for first encounter
+
+JUSTIFICATION:
+- These metrics are used in 80% of analytics queries
+- Computing them during ETL (once) vs. every query (thousands of times)
+- Transforms Question 3's expensive self-join into a simple WHERE clause
+- Slightly increases ETL complexity but dramatically improves query performance
+- Storage cost is minimal (extra 40-50 bytes per fact row)
+
+
+
+
+
+### DECISION 4: Bridge Tables for Many-to-Many Relationships
+--------------------------------------------------------
+
+YES - Use bridge tables for diagnoses and procedures
+
+BRIDGE_ENCOUNTER_DIAGNOSES:
+- encounter_key (FK to fact_encounters)
+- diagnosis_key (FK to dim_diagnosis)
+- diagnosis_sequence (INT, 1=primary, 2+=secondary)
+- diagnosis_group_key (INT, enables weighting for one-to-many scenarios)
+
+BRIDGE_ENCOUNTER_PROCEDURES:
+- encounter_key (FK to fact_encounters)
+- procedure_key (FK to dim_procedure)
+- procedure_date (DATE)
+- procedure_sequence (INT)
+- procedure_group_key (INT)
+
+RATIONALE FOR USING BRIDGE TABLES:
+1. Flexibility: Some queries need all diagnoses/procedures per encounter
+2. Accuracy: Avoids artificially inflating fact rows when analyzing specific codes
+3. Best Practice: Standard dimensional modeling pattern for many-to-many
+4. Completeness: Preserves all diagnosis and procedure details
+
+HOW THIS WORKS:
+- Most queries (Questions 1, 4) don't need diagnosis details → skip bridge tables
+- Specific queries (Question 2, diagnosis-specific analysis) → JOIN bridge tables
+- Use pre-aggregated counts (diagnosis_count, procedure_count) for simple metrics
+- Use bridge tables only when specific codes are required
+
+ALTERNATIVE CONSIDERED - Denormalize all diagnoses into fact:
+- Would require multiple diagnosis columns (diagnosis_1, diagnosis_2, etc.)
+- Wastes space when encounters have fewer diagnoses than max columns
+- Makes querying specific diagnoses awkward (need to check multiple columns)
+- REJECTED: Bridge table is more flexible
+
+-------------------------------------------------------------------------------------
+
+
+
+### DECISION 5: Slowly Changing Dimensions (SCD) Strategy
+-----------------------------------------------------
+
+DIM_PATIENT: Type 1 (Overwrite)
+- Demographics update rarely
+- Historical analysis doesn't require knowing patient's old address or phone
+- Simplifies dimension and queries
+
+DIM_PROVIDER: Type 1 (Overwrite)
+- Specialty changes are rare
+- If provider changes specialty, update dimension
+- Historical encounters remain associated with provider key (correct)
+- New encounters use updated specialty (correct behavior)
+
+DIM_DEPARTMENT: Type 1 (Overwrite)
+- Floor or capacity changes don't require history
+- Operational current state is what matters
+
+DIM_DIAGNOSIS & DIM_PROCEDURE: Type 0 (No Changes)
+- ICD-10 and CPT codes are standardized
+- Descriptions may get clarifications but keep original for consistency
+- These are reference dimensions, essentially immutable
+
+DIM_DATE: Type 0 (Pre-loaded)
+- Generated once for 10-20 year range
+- Never changes
+
+--------------------------------------------------------------------------
+
+
+### DECISION 6: Additional Design Choices
+-------------------------------------
+
+INDEXING STRATEGY:
+- Clustered index on fact_encounters: date_key (optimizes time-series queries)
+- Non-clustered indexes on all dimension foreign keys in fact table
+- Bitmap indexes on low-cardinality columns (encounter_type_key, is_readmission_30day)
+
+PARTITIONING:
+- Partition fact_encounters by date_key (monthly partitions)
+- Enables fast date range queries and efficient data archival
+- Improves query performance by partition elimination
+
+NAMING CONVENTIONS:
+- Surrogate keys: table_name_key (e.g., patient_key)
+- Business keys: original_id (e.g., patient_id)
+- Dimensions: dim_* prefix
+- Facts: fact_* prefix
+- Bridges: bridge_* prefix
+
+NULL HANDLING:
+- Use surrogate key = -1 for unknown/missing dimensions
+- Create "Unknown" rows in each dimension table
+- Never allow NULL foreign keys in fact table
+- Enables consistent LEFT JOIN behavior
