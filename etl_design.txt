@@ -1468,7 +1468,7 @@ BEGIN
     SET v_batch_id = fn_get_next_batch_id();
     
     SELECT CONCAT('Starting Master ETL for date: ', p_load_date) AS status;
-    SELECT '========================================' AS status;
+  
     
     -- PHASE 1: Load Dimensions (order matters for FK dependencies)
     SELECT 'PHASE 1: Loading Dimension Tables' AS status;
@@ -1490,18 +1490,15 @@ BEGIN
     CALL sp_load_dim_patient();
     CALL sp_load_dim_provider();  -- Must run after specialty & department
     
-    SELECT '========================================' AS status;
     SELECT 'PHASE 2: Loading Fact Table' AS status;
     
     CALL sp_load_fact_encounters(p_load_date);
     
-    SELECT '========================================' AS status;
     SELECT 'PHASE 3: Loading Bridge Tables' AS status;
     
     CALL sp_load_bridge_encounter_diagnoses(p_load_date);
     CALL sp_load_bridge_encounter_procedures(p_load_date);
-    
-    SELECT '========================================' AS status;
+
     SELECT 'PHASE 4: Refreshing Aggregate Tables' AS status;
     
     -- Refresh monthly summary for current month (procedure not yet implemented)
@@ -1515,10 +1512,6 @@ BEGIN
         TIMESTAMPDIFF(SECOND, v_start_time, NOW())
     );
     
-    SELECT '========================================' AS status;
-    SELECT 'ETL COMPLETED SUCCESSFULLY!' AS status;
-    SELECT CONCAT('Duration: ', TIMESTAMPDIFF(SECOND, v_start_time, NOW()), ' seconds') AS status;
-    SELECT '========================================' AS status;
 END //
 
 DELIMITER ;
