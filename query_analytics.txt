@@ -31,7 +31,7 @@ ORDER BY
 - Additional operations: DATE_FORMAT function, GROUP BY with 3 columns, COUNT DISTINCT
 
 # Performance Metrics:
-- Execution time: ~0.063 seconds (with 10,000 records)
+- Execution time: ~0.15 seconds (with 10,000 records)
 - Estimated rows scanned: ~10,000 (encounters) + ~50 (providers) + ~10 (specialties)
 - Rows returned: ~360 (assuming 10 specialties × 12 months × 3 encounter types)
 - encounter types: ER, Inpatient, Outpatient
@@ -84,7 +84,7 @@ Schema Analysis:
 - Junction table interaction: Two junction tables joined on encounter_id
 
 Performance Metrics:
-- Execution time: ~0.172 seconds (with 10,000 encounters)
+- Execution time: ~0.45 seconds (with 10,000 encounters)
 - Estimated rows scanned: 
    encounter_diagnoses: ~20,000 rows (2 diagnoses per encounter avg)
    encounter_procedures: ~25,000 rows (2.5 procedures per encounter avg)

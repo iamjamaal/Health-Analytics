@@ -707,8 +707,10 @@ CREATE TABLE bridge_encounter_diagnoses (
     INDEX idx_diagnosis_encounter (diagnosis_key, encounter_key),
     
     -- Foreign Keys
-    FOREIGN KEY (encounter_key) REFERENCES fact_encounters(encounter_key)
-        ON DELETE CASCADE,
+    -- Note: FK to fact_encounters removed due to MySQL partitioning limitation
+    -- Referential integrity enforced in ETL process
+    -- FOREIGN KEY (encounter_key) REFERENCES fact_encounters(encounter_key)
+    --     ON DELETE CASCADE,
     FOREIGN KEY (diagnosis_key) REFERENCES dim_diagnosis(diagnosis_key),
     
     -- Unique constraint
@@ -766,8 +768,10 @@ CREATE TABLE bridge_encounter_procedures (
     INDEX idx_performing_provider (performing_provider_key),
     
     -- Foreign Keys
-    FOREIGN KEY (encounter_key) REFERENCES fact_encounters(encounter_key)
-        ON DELETE CASCADE,
+    -- Note: FK to fact_encounters removed due to MySQL partitioning limitation
+    -- Referential integrity enforced in ETL process
+    -- FOREIGN KEY (encounter_key) REFERENCES fact_encounters(encounter_key)
+    --     ON DELETE CASCADE,
     FOREIGN KEY (procedure_key) REFERENCES dim_procedure(procedure_key),
     FOREIGN KEY (performing_provider_key) REFERENCES dim_provider(provider_key),
     
