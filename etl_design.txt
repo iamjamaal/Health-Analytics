@@ -1,0 +1,1666 @@
+                                 HEALTHCARE ANALYTICS ETL DESIGN
+                                  Complete Implementation Guide
+
+
+-- Purpose: Extract, Transform, Load processes for Star Schema
+-- Approach: Incremental loads with full dimension refresh
+
+
+-- ETL CONFIGURATION AND CONTROL TABLES
+-- ETL Control Table
+CREATE TABLE IF NOT EXISTS etl_control (
+    control_id INT AUTO_INCREMENT PRIMARY KEY,
+    process_name VARCHAR(100) NOT NULL UNIQUE,
+    last_successful_run TIMESTAMP NULL,
+    last_extract_date DATE NULL,
+    is_enabled BOOLEAN DEFAULT TRUE,
+    run_frequency VARCHAR(50) DEFAULT 'DAILY',
+    notes TEXT,
+    created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) COMMENT 'ETL process control and tracking';
+
+
+
+-- ETL Run Log Table
+CREATE TABLE IF NOT EXISTS etl_run_log (
+    run_id INT AUTO_INCREMENT PRIMARY KEY,
+    process_name VARCHAR(100) NOT NULL,
+    etl_batch_id INT NOT NULL,
+    start_time TIMESTAMP NOT NULL,
+    end_time TIMESTAMP NULL,
+    status VARCHAR(50) NOT NULL,
+    rows_extracted INT DEFAULT 0,
+    rows_inserted INT DEFAULT 0,
+    rows_updated INT DEFAULT 0,
+    rows_deleted INT DEFAULT 0,
+    duration_seconds INT,
+    error_message TEXT,
+    INDEX idx_process_name (process_name),
+    INDEX idx_batch_id (etl_batch_id),
+    INDEX idx_start_time (start_time),
+    INDEX idx_status (status)
+) COMMENT 'ETL execution log for monitoring and troubleshooting';
+
+
+-- ETL Error Log Table
+CREATE TABLE IF NOT EXISTS etl_error_log (
+    error_id INT AUTO_INCREMENT PRIMARY KEY,
+    etl_batch_id INT,
+    process_name VARCHAR(100),
+    error_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    error_severity VARCHAR(20),
+    error_message TEXT,
+    error_details TEXT,
+    sql_state VARCHAR(5),
+    INDEX idx_batch_id (etl_batch_id),
+    INDEX idx_error_time (error_time)
+) COMMENT 'Detailed error tracking for ETL processes';
+
+
+-- Data Quality Check Results
+CREATE TABLE IF NOT EXISTS etl_data_quality_log (
+    check_id INT AUTO_INCREMENT PRIMARY KEY,
+    etl_batch_id INT NOT NULL,
+    check_name VARCHAR(100) NOT NULL,
+    check_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    check_status VARCHAR(20),
+    expected_value VARCHAR(100),
+    actual_value VARCHAR(100),
+    variance_pct DECIMAL(10,2),
+    passed BOOLEAN,
+    details TEXT,
+    INDEX idx_batch_id (etl_batch_id),
+    INDEX idx_check_time (check_time)
+) COMMENT 'Data quality validation results';
+
+-- Initialize ETL Control Records
+INSERT INTO etl_control (process_name, run_frequency, notes) VALUES
+('load_dim_date', 'ONCE', 'One-time load of date dimension for 20 years'),
+('load_dim_specialty', 'DAILY', 'Full refresh of specialty dimension'),
+('load_dim_department', 'DAILY', 'Full refresh of department dimension'),
+('load_dim_encounter_type', 'ONCE', 'One-time load of encounter types'),
+('load_dim_diagnosis', 'DAILY', 'Full refresh of diagnosis codes'),
+('load_dim_procedure', 'DAILY', 'Full refresh of procedure codes'),
+('load_dim_patient', 'DAILY', 'Type 1 SCD - full refresh with updates'),
+('load_dim_provider', 'DAILY', 'Type 1 SCD - full refresh with updates'),
+('load_fact_encounters', 'DAILY', 'Incremental load with 7-day lookback'),
+('load_bridge_diagnoses', 'DAILY', 'Incremental load matching fact'),
+('load_bridge_procedures', 'DAILY', 'Incremental load matching fact'),
+('refresh_monthly_summary', 'DAILY', 'Refresh current month summary')
+ON DUPLICATE KEY UPDATE updated_date = CURRENT_TIMESTAMP;
+
+
+
+-- UTILITY FUNCTIONS AND PROCEDURES
+-- Function to get next ETL batch ID
+DELIMITER //
+
+CREATE FUNCTION fn_get_next_batch_id()
+RETURNS INT
+DETERMINISTIC
+BEGIN
+    DECLARE v_batch_id INT;
+    SELECT COALESCE(MAX(etl_batch_id), 0) + 1 INTO v_batch_id FROM etl_run_log;
+    RETURN v_batch_id;
+END //
+
+DELIMITER ;
+
+-- Procedure to log ETL start
+DELIMITER //
+
+CREATE PROCEDURE sp_log_etl_start(
+    IN p_process_name VARCHAR(100),
+    IN p_batch_id INT,
+    OUT p_run_id INT
+)
+BEGIN
+    INSERT INTO etl_run_log (
+        process_name, etl_batch_id, start_time, status
+    ) VALUES (
+        p_process_name, p_batch_id, NOW(), 'RUNNING'
+    );
+    
+    SET p_run_id = LAST_INSERT_ID();
+END //
+
+DELIMITER ;
+
+-- Procedure to log ETL completion
+DELIMITER //
+
+CREATE PROCEDURE sp_log_etl_complete(
+    IN p_run_id INT,
+    IN p_rows_extracted INT,
+    IN p_rows_inserted INT,
+    IN p_rows_updated INT,
+    IN p_status VARCHAR(50)
+)
+BEGIN
+    UPDATE etl_run_log
+    SET 
+        end_time = NOW(),
+        status = p_status,
+        rows_extracted = p_rows_extracted,
+        rows_inserted = p_rows_inserted,
+        rows_updated = p_rows_updated,
+        duration_seconds = TIMESTAMPDIFF(SECOND, start_time, NOW())
+    WHERE run_id = p_run_id;
+END //
+
+DELIMITER ;
+
+
+
+
+-- PHASE 1: DIMENSION LOAD PROCEDURES
+-- 1.1: LOAD DIM_DATE
+-- One-time load: Generate 20 years of dates
+DELIMITER //
+
+CREATE PROCEDURE sp_load_dim_date()
+BEGIN
+    DECLARE v_batch_id INT;
+    DECLARE v_run_id INT;
+    DECLARE v_start_date DATE DEFAULT '2020-01-01';
+    DECLARE v_end_date DATE DEFAULT '2040-12-31';
+    DECLARE v_current_date DATE;
+    DECLARE v_rows_inserted INT DEFAULT 0;
+    
+    -- Exception handler
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        GET DIAGNOSTICS CONDITION 1
+            @sqlstate = RETURNED_SQLSTATE, 
+            @errno = MYSQL_ERRNO, 
+            @text = MESSAGE_TEXT;
+        
+        INSERT INTO etl_error_log (etl_batch_id, process_name, error_severity, error_message)
+        VALUES (v_batch_id, 'load_dim_date', 'ERROR', @text);
+        
+        UPDATE etl_run_log SET status = 'FAILED', end_time = NOW() WHERE run_id = v_run_id;
+        ROLLBACK;
+    END;
+    
+    -- Get batch ID and log start
+    SET v_batch_id = fn_get_next_batch_id();
+    CALL sp_log_etl_start('load_dim_date', v_batch_id, v_run_id);
+    
+    START TRANSACTION;
+        
+        -- Clear existing data (except unknown row)
+        DELETE FROM dim_date WHERE date_key != -1;
+        
+        -- Loop through dates
+        SET v_current_date = v_start_date;
+        
+        WHILE v_current_date <= v_end_date DO
+            INSERT INTO dim_date (
+                date_key,
+                calendar_date,
+                year,
+                quarter,
+                month,
+                month_name,
+                month_abbr,
+                week_of_year,
+                day_of_month,
+                day_of_week,
+                day_name,
+                day_abbr,
+                is_weekend,
+                is_holiday,
+                is_weekday,
+                fiscal_year,
+                fiscal_quarter,
+                fiscal_month,
+                fiscal_week,
+                day_of_year,
+                week_of_month
+            ) VALUES (
+                CAST(DATE_FORMAT(v_current_date, '%Y%m%d') AS UNSIGNED),
+                v_current_date,
+                YEAR(v_current_date),
+                QUARTER(v_current_date),
+                MONTH(v_current_date),
+                DATE_FORMAT(v_current_date, '%M'),
+                DATE_FORMAT(v_current_date, '%b'),
+                WEEK(v_current_date, 3),
+                DAY(v_current_date),
+                DAYOFWEEK(v_current_date),
+                DATE_FORMAT(v_current_date, '%W'),
+                DATE_FORMAT(v_current_date, '%a'),
+                DAYOFWEEK(v_current_date) IN (1, 7),
+                -- Simple holiday check (extend as needed)
+                (MONTH(v_current_date) = 1 AND DAY(v_current_date) = 1) OR  -- New Year
+                (MONTH(v_current_date) = 7 AND DAY(v_current_date) = 4) OR  -- Independence Day
+                (MONTH(v_current_date) = 12 AND DAY(v_current_date) = 25),  -- Christmas
+                DAYOFWEEK(v_current_date) NOT IN (1, 7),
+                -- Fiscal year (starts July 1)
+                CASE 
+                    WHEN MONTH(v_current_date) >= 7 THEN YEAR(v_current_date) + 1
+                    ELSE YEAR(v_current_date)
+                END,
+                -- Fiscal quarter
+                CASE 
+                    WHEN MONTH(v_current_date) BETWEEN 7 AND 9 THEN 1
+                    WHEN MONTH(v_current_date) BETWEEN 10 AND 12 THEN 2
+                    WHEN MONTH(v_current_date) BETWEEN 1 AND 3 THEN 3
+                    ELSE 4
+                END,
+                -- Fiscal month
+                CASE 
+                    WHEN MONTH(v_current_date) >= 7 THEN MONTH(v_current_date) - 6
+                    ELSE MONTH(v_current_date) + 6
+                END,
+                -- Fiscal week (approximate)
+                CASE 
+                    WHEN MONTH(v_current_date) >= 7 
+                    THEN WEEK(v_current_date, 3) - WEEK(CONCAT(YEAR(v_current_date), '-07-01'), 3) + 1
+                    ELSE WEEK(v_current_date, 3) + 26
+                END,
+                DAYOFYEAR(v_current_date),
+                CEILING(DAY(v_current_date) / 7)
+            );
+            
+            SET v_rows_inserted = v_rows_inserted + 1;
+            SET v_current_date = DATE_ADD(v_current_date, INTERVAL 1 DAY);
+        END WHILE;
+        
+        COMMIT;
+        
+        -- Log completion
+        CALL sp_log_etl_complete(v_run_id, v_rows_inserted, v_rows_inserted, 0, 'SUCCESS');
+        
+        -- Update control table
+        UPDATE etl_control 
+        SET last_successful_run = NOW(), last_extract_date = v_end_date
+        WHERE process_name = 'load_dim_date';
+    
+    SELECT CONCAT('dim_date loaded: ', v_rows_inserted, ' rows') AS result;
+END //
+
+DELIMITER ;
+
+
+
+
+-- 1.2: LOAD DIM_PATIENT
+-- Type 1 SCD: Full refresh with updates
+DELIMITER //
+
+CREATE PROCEDURE sp_load_dim_patient()
+BEGIN
+    DECLARE v_batch_id INT;
+    DECLARE v_run_id INT;
+    DECLARE v_rows_extracted INT DEFAULT 0;
+    DECLARE v_rows_inserted INT DEFAULT 0;
+    DECLARE v_rows_updated INT DEFAULT 0;
+    
+    -- Exception handler
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        GET DIAGNOSTICS CONDITION 1 @text = MESSAGE_TEXT;
+        INSERT INTO etl_error_log (etl_batch_id, process_name, error_severity, error_message)
+        VALUES (v_batch_id, 'load_dim_patient', 'ERROR', @text);
+        UPDATE etl_run_log SET status = 'FAILED', end_time = NOW() WHERE run_id = v_run_id;
+        ROLLBACK;
+    END;
+    
+    SET v_batch_id = fn_get_next_batch_id();
+    CALL sp_log_etl_start('load_dim_patient', v_batch_id, v_run_id);
+    
+    START TRANSACTION;
+        
+        -- Stage: Extract from OLTP
+        CREATE TEMPORARY TABLE tmp_patients AS
+        SELECT 
+            patient_id,
+            first_name,
+            last_name,
+            CONCAT(first_name, ' ', last_name) AS full_name,
+            date_of_birth,
+            TIMESTAMPDIFF(YEAR, date_of_birth, CURDATE()) AS age,
+            CASE 
+                WHEN TIMESTAMPDIFF(YEAR, date_of_birth, CURDATE()) < 18 THEN '0-17'
+                WHEN TIMESTAMPDIFF(YEAR, date_of_birth, CURDATE()) BETWEEN 18 AND 35 THEN '18-35'
+                WHEN TIMESTAMPDIFF(YEAR, date_of_birth, CURDATE()) BETWEEN 36 AND 50 THEN '36-50'
+                WHEN TIMESTAMPDIFF(YEAR, date_of_birth, CURDATE()) BETWEEN 51 AND 65 THEN '51-65'
+                ELSE '66+'
+            END AS age_group,
+            CONCAT(
+                FLOOR(TIMESTAMPDIFF(YEAR, date_of_birth, CURDATE()) / 10) * 10,
+                '-',
+                FLOOR(TIMESTAMPDIFF(YEAR, date_of_birth, CURDATE()) / 10) * 10 + 9
+            ) AS age_decade,
+            gender,
+            CASE gender
+                WHEN 'M' THEN 'Male'
+                WHEN 'F' THEN 'Female'
+                WHEN 'O' THEN 'Other'
+                ELSE 'Unknown'
+            END AS gender_description,
+            mrn,
+            CURDATE() AS effective_date
+        FROM oltp.patients
+        WHERE patient_id > 0;  -- Exclude test patients
+        
+        SELECT COUNT(*) INTO v_rows_extracted FROM tmp_patients;
+        
+        -- Update existing patients (Type 1 - overwrite)
+        UPDATE dim_patient dp
+        INNER JOIN tmp_patients tp ON dp.patient_id = tp.patient_id
+        SET 
+            dp.first_name = tp.first_name,
+            dp.last_name = tp.last_name,
+            dp.full_name = tp.full_name,
+            dp.date_of_birth = tp.date_of_birth,
+            dp.age = tp.age,
+            dp.age_group = tp.age_group,
+            dp.age_decade = tp.age_decade,
+            dp.gender = tp.gender,
+            dp.gender_description = tp.gender_description,
+            dp.mrn = tp.mrn,
+            dp.effective_date = tp.effective_date
+        WHERE dp.patient_key != -1;  -- Don't update unknown row
+        
+        SET v_rows_updated = ROW_COUNT();
+        
+        -- Insert new patients
+        INSERT INTO dim_patient (
+            patient_id, first_name, last_name, full_name,
+            date_of_birth, age, age_group, age_decade,
+            gender, gender_description, mrn,
+            effective_date, end_date, is_current, is_test_patient
+        )
+        SELECT 
+            tp.patient_id, tp.first_name, tp.last_name, tp.full_name,
+            tp.date_of_birth, tp.age, tp.age_group, tp.age_decade,
+            tp.gender, tp.gender_description, tp.mrn,
+            tp.effective_date, '9999-12-31', TRUE, FALSE
+        FROM tmp_patients tp
+        LEFT JOIN dim_patient dp ON tp.patient_id = dp.patient_id
+        WHERE dp.patient_key IS NULL;
+        
+        SET v_rows_inserted = ROW_COUNT();
+        
+        DROP TEMPORARY TABLE tmp_patients;
+        
+        COMMIT;
+        
+        CALL sp_log_etl_complete(v_run_id, v_rows_extracted, v_rows_inserted, v_rows_updated, 'SUCCESS');
+        UPDATE etl_control SET last_successful_run = NOW() WHERE process_name = 'load_dim_patient';
+    
+    SELECT CONCAT('dim_patient loaded: ', v_rows_inserted, ' inserted, ', v_rows_updated, ' updated') AS result;
+END //
+
+DELIMITER ;
+
+
+
+-- 1.3: LOAD DIM_SPECIALTY
+-- Full refresh with MERGE logic
+DELIMITER //
+
+CREATE PROCEDURE sp_load_dim_specialty()
+BEGIN
+    DECLARE v_batch_id INT;
+    DECLARE v_run_id INT;
+    DECLARE v_rows_extracted INT DEFAULT 0;
+    DECLARE v_rows_inserted INT DEFAULT 0;
+    DECLARE v_rows_updated INT DEFAULT 0;
+    
+    -- Exception handler
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        GET DIAGNOSTICS CONDITION 1 @text = MESSAGE_TEXT;
+        INSERT INTO etl_error_log (etl_batch_id, process_name, error_severity, error_message)
+        VALUES (v_batch_id, 'load_dim_specialty', 'ERROR', @text);
+        UPDATE etl_run_log SET status = 'FAILED', end_time = NOW() WHERE run_id = v_run_id;
+        ROLLBACK;
+    END;
+    
+    SET v_batch_id = fn_get_next_batch_id();
+    CALL sp_log_etl_start('load_dim_specialty', v_batch_id, v_run_id);
+    
+    START TRANSACTION;
+        
+        -- Extract and transform
+        CREATE TEMPORARY TABLE tmp_specialties AS
+        SELECT 
+            specialty_id,
+            specialty_name,
+            specialty_code,
+            CASE 
+                WHEN specialty_code IN ('SURG', 'ORTH') THEN 'Surgical'
+                WHEN specialty_code IN ('CARD', 'IM', 'NEURO', 'ONC') THEN 'Medical'
+                WHEN specialty_code IN ('RAD') THEN 'Diagnostic'
+                WHEN specialty_code IN ('ER') THEN 'Emergency'
+                WHEN specialty_code IN ('PEDS') THEN 'Pediatric'
+                WHEN specialty_code IN ('PSYCH') THEN 'Behavioral Health'
+                ELSE 'Other'
+            END AS specialty_category,
+            CASE WHEN specialty_code IN ('SURG', 'ORTH') THEN TRUE ELSE FALSE END AS is_surgical,
+            CASE WHEN specialty_code IN ('IM', 'PEDS') THEN TRUE ELSE FALSE END AS is_primary_care,
+            CASE WHEN specialty_code NOT IN ('IM', 'PEDS', 'ER') THEN TRUE ELSE FALSE END AS requires_referral
+        FROM oltp.specialties;
+        
+        SELECT COUNT(*) INTO v_rows_extracted FROM tmp_specialties;
+        
+        -- Update existing
+        UPDATE dim_specialty ds
+        INNER JOIN tmp_specialties ts ON ds.specialty_id = ts.specialty_id
+        SET 
+            ds.specialty_name = ts.specialty_name,
+            ds.specialty_code = ts.specialty_code,
+            ds.specialty_category = ts.specialty_category,
+            ds.is_surgical = ts.is_surgical,
+            ds.is_primary_care = ts.is_primary_care,
+            ds.requires_referral = ts.requires_referral
+        WHERE ds.specialty_key != -1;
+        
+        SET v_rows_updated = ROW_COUNT();
+        
+        -- Insert new
+        INSERT INTO dim_specialty (
+            specialty_id, specialty_name, specialty_code, specialty_category,
+            is_surgical, is_primary_care, requires_referral
+        )
+        SELECT 
+            ts.specialty_id, ts.specialty_name, ts.specialty_code, ts.specialty_category,
+            ts.is_surgical, ts.is_primary_care, ts.requires_referral
+        FROM tmp_specialties ts
+        LEFT JOIN dim_specialty ds ON ts.specialty_id = ds.specialty_id
+        WHERE ds.specialty_key IS NULL;
+        
+        SET v_rows_inserted = ROW_COUNT();
+        
+        DROP TEMPORARY TABLE tmp_specialties;
+        
+        COMMIT;
+        
+        CALL sp_log_etl_complete(v_run_id, v_rows_extracted, v_rows_inserted, v_rows_updated, 'SUCCESS');
+        UPDATE etl_control SET last_successful_run = NOW() WHERE process_name = 'load_dim_specialty';
+    
+    SELECT CONCAT('dim_specialty loaded: ', v_rows_inserted, ' inserted, ', v_rows_updated, ' updated') AS result;
+END //
+
+DELIMITER ;
+
+
+
+-- 1.4: LOAD DIM_DEPARTMENT
+-- Full refresh
+DELIMITER //
+
+CREATE PROCEDURE sp_load_dim_department()
+BEGIN
+    DECLARE v_batch_id INT;
+    DECLARE v_run_id INT;
+    DECLARE v_rows_extracted INT DEFAULT 0;
+    DECLARE v_rows_inserted INT DEFAULT 0;
+    DECLARE v_rows_updated INT DEFAULT 0;
+    
+    -- Exception handler
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        GET DIAGNOSTICS CONDITION 1 @text = MESSAGE_TEXT;
+        INSERT INTO etl_error_log (etl_batch_id, process_name, error_severity, error_message)
+        VALUES (v_batch_id, 'load_dim_department', 'ERROR', @text);
+        UPDATE etl_run_log SET status = 'FAILED', end_time = NOW() WHERE run_id = v_run_id;
+        ROLLBACK;
+    END;
+    
+    SET v_batch_id = fn_get_next_batch_id();
+    CALL sp_log_etl_start('load_dim_department', v_batch_id, v_run_id);
+    
+    START TRANSACTION;
+        
+        CREATE TEMPORARY TABLE tmp_departments AS
+        SELECT 
+            department_id,
+            department_name,
+            UPPER(LEFT(department_name, 3)) AS department_code,
+            floor,
+            capacity,
+            CASE 
+                WHEN department_name LIKE '%Surgery%' OR department_name LIKE '%OR%' THEN 'Surgical'
+                WHEN department_name LIKE '%Emergency%' OR department_name LIKE '%ER%' THEN 'Emergency'
+                WHEN department_name LIKE '%Radiology%' OR department_name LIKE '%Imaging%' THEN 'Diagnostic'
+                WHEN department_name LIKE '%ICU%' OR department_name LIKE '%Intensive%' THEN 'Critical Care'
+                WHEN department_name LIKE '%Lab%' THEN 'Laboratory'
+                ELSE 'Clinical'
+            END AS department_type,
+            -- Service line inference
+            CASE 
+                WHEN department_name LIKE '%Cardiology%' THEN 'Cardiology'
+                WHEN department_name LIKE '%Orthopedic%' THEN 'Orthopedics'
+                WHEN department_name LIKE '%Neurology%' THEN 'Neurology'
+                WHEN department_name LIKE '%Oncology%' THEN 'Oncology'
+                ELSE 'General'
+            END AS service_line,
+            -- Boolean flags
+            CASE WHEN department_name NOT LIKE '%Outpatient%' THEN TRUE ELSE FALSE END AS is_inpatient,
+            CASE WHEN department_name LIKE '%Outpatient%' OR department_name LIKE '%Clinic%' THEN TRUE ELSE FALSE END AS is_outpatient,
+            CASE WHEN department_name LIKE '%Emergency%' OR department_name LIKE '%ER%' THEN TRUE ELSE FALSE END AS is_emergency,
+            CASE WHEN department_name LIKE '%ICU%' OR department_name LIKE '%Intensive%' THEN TRUE ELSE FALSE END AS is_critical_care
+        FROM oltp.departments;
+        
+        SELECT COUNT(*) INTO v_rows_extracted FROM tmp_departments;
+        
+        -- Update existing
+        UPDATE dim_department dd
+        INNER JOIN tmp_departments td ON dd.department_id = td.department_id
+        SET 
+            dd.department_name = td.department_name,
+            dd.department_code = td.department_code,
+            dd.floor = td.floor,
+            dd.capacity = td.capacity,
+            dd.department_type = td.department_type,
+            dd.service_line = td.service_line,
+            dd.is_inpatient = td.is_inpatient,
+            dd.is_outpatient = td.is_outpatient,
+            dd.is_emergency = td.is_emergency,
+            dd.is_critical_care = td.is_critical_care
+        WHERE dd.department_key != -1;
+        
+        SET v_rows_updated = ROW_COUNT();
+        
+        -- Insert new
+        INSERT INTO dim_department (
+            department_id, department_name, department_code, floor, capacity,
+            department_type, service_line, is_inpatient, is_outpatient, is_emergency, is_critical_care
+        )
+        SELECT 
+            td.department_id, td.department_name, td.department_code, td.floor, td.capacity,
+            td.department_type, td.service_line, td.is_inpatient, td.is_outpatient, td.is_emergency, td.is_critical_care
+        FROM tmp_departments td
+        LEFT JOIN dim_department dd ON td.department_id = dd.department_id
+        WHERE dd.department_key IS NULL;
+        
+        SET v_rows_inserted = ROW_COUNT();
+        
+        DROP TEMPORARY TABLE tmp_departments;
+        
+        COMMIT;
+        
+        CALL sp_log_etl_complete(v_run_id, v_rows_extracted, v_rows_inserted, v_rows_updated, 'SUCCESS');
+        UPDATE etl_control SET last_successful_run = NOW() WHERE process_name = 'load_dim_department';
+    
+    SELECT CONCAT('dim_department loaded: ', v_rows_inserted, ' inserted, ', v_rows_updated, ' updated') AS result;
+END //
+
+DELIMITER ;
+
+
+
+
+-- 1.5: LOAD DIM_PROVIDER
+-- Type 1 SCD with denormalized specialty/department
+DELIMITER //
+
+CREATE PROCEDURE sp_load_dim_provider()
+BEGIN
+    DECLARE v_batch_id INT;
+    DECLARE v_run_id INT;
+    DECLARE v_rows_extracted INT DEFAULT 0;
+    DECLARE v_rows_inserted INT DEFAULT 0;
+    DECLARE v_rows_updated INT DEFAULT 0;
+    
+    -- Exception handler
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        GET DIAGNOSTICS CONDITION 1 @text = MESSAGE_TEXT;
+        INSERT INTO etl_error_log (etl_batch_id, process_name, error_severity, error_message)
+        VALUES (v_batch_id, 'load_dim_provider', 'ERROR', @text);
+        UPDATE etl_run_log SET status = 'FAILED', end_time = NOW() WHERE run_id = v_run_id;
+        ROLLBACK;
+    END;
+    
+    SET v_batch_id = fn_get_next_batch_id();
+    CALL sp_log_etl_start('load_dim_provider', v_batch_id, v_run_id);
+    
+    START TRANSACTION;
+        
+        -- Extract with JOINs to get denormalized data
+        CREATE TEMPORARY TABLE tmp_providers AS
+        SELECT 
+            p.provider_id,
+            p.first_name,
+            p.last_name,
+            CONCAT(p.first_name, ' ', p.last_name) AS full_name,
+            p.credential,
+            -- Get surrogate keys
+            COALESCE(ds.specialty_key, -1) AS specialty_key,
+            COALESCE(s.specialty_name, 'Unknown') AS specialty_name,
+            COALESCE(s.specialty_code, 'UNK') AS specialty_code,
+            COALESCE(dd.department_key, -1) AS department_key,
+            COALESCE(d.department_name, 'Unknown') AS department_name,
+            CASE p.credential
+                WHEN 'MD' THEN 'Attending'
+                WHEN 'DO' THEN 'Attending'
+                WHEN 'NP' THEN 'APP'
+                WHEN 'PA' THEN 'APP'
+                ELSE 'Other'
+            END AS provider_type,
+            TRUE AS is_active,
+            CURDATE() AS effective_date
+        FROM oltp.providers p
+        LEFT JOIN oltp.specialties s ON p.specialty_id = s.specialty_id
+        LEFT JOIN oltp.departments d ON p.department_id = d.department_id
+        LEFT JOIN dim_specialty ds ON s.specialty_id = ds.specialty_id
+        LEFT JOIN dim_department dd ON d.department_id = dd.department_id;
+        
+        SELECT COUNT(*) INTO v_rows_extracted FROM tmp_providers;
+        
+        -- Update existing
+        UPDATE dim_provider dp
+        INNER JOIN tmp_providers tp ON dp.provider_id = tp.provider_id
+        SET 
+            dp.first_name = tp.first_name,
+            dp.last_name = tp.last_name,
+            dp.full_name = tp.full_name,
+            dp.credential = tp.credential,
+            dp.specialty_key = tp.specialty_key,
+            dp.specialty_name = tp.specialty_name,
+            dp.specialty_code = tp.specialty_code,
+            dp.department_key = tp.department_key,
+            dp.department_name = tp.department_name,
+            dp.provider_type = tp.provider_type,
+            dp.is_active = tp.is_active,
+            dp.effective_date = tp.effective_date
+        WHERE dp.provider_key != -1;
+        
+        SET v_rows_updated = ROW_COUNT();
+        
+        -- Insert new
+        INSERT INTO dim_provider (
+            provider_id, first_name, last_name, full_name, credential,
+            specialty_key, specialty_name, specialty_code,
+            department_key, department_name,
+            provider_type, is_active, effective_date, end_date, is_current
+        )
+        SELECT 
+            tp.provider_id, tp.first_name, tp.last_name, tp.full_name, tp.credential,
+            tp.specialty_key, tp.specialty_name, tp.specialty_code,
+            tp.department_key, tp.department_name,
+            tp.provider_type, tp.is_active, tp.effective_date, '9999-12-31', TRUE
+        FROM tmp_providers tp
+        LEFT JOIN dim_provider dp ON tp.provider_id = dp.provider_id
+        WHERE dp.provider_key IS NULL;
+        
+        SET v_rows_inserted = ROW_COUNT();
+        
+        DROP TEMPORARY TABLE tmp_providers;
+        
+        COMMIT;
+        
+        CALL sp_log_etl_complete(v_run_id, v_rows_extracted, v_rows_inserted, v_rows_updated, 'SUCCESS');
+        UPDATE etl_control SET last_successful_run = NOW() WHERE process_name = 'load_dim_provider';
+    
+    SELECT CONCAT('dim_provider loaded: ', v_rows_inserted, ' inserted, ', v_rows_updated, ' updated') AS result;
+END //
+
+DELIMITER ;
+
+
+
+-- 1.6: LOAD DIM_DIAGNOSIS
+-- Full refresh of diagnosis codes
+DELIMITER //
+
+CREATE PROCEDURE sp_load_dim_diagnosis()
+BEGIN
+    DECLARE v_batch_id INT;
+    DECLARE v_run_id INT;
+    DECLARE v_rows_extracted INT DEFAULT 0;
+    DECLARE v_rows_inserted INT DEFAULT 0;
+    DECLARE v_rows_updated INT DEFAULT 0;
+    
+    -- Exception handler
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        GET DIAGNOSTICS CONDITION 1 @text = MESSAGE_TEXT;
+        INSERT INTO etl_error_log (etl_batch_id, process_name, error_severity, error_message)
+        VALUES (v_batch_id, 'load_dim_diagnosis', 'ERROR', @text);
+        UPDATE etl_run_log SET status = 'FAILED', end_time = NOW() WHERE run_id = v_run_id;
+        ROLLBACK;
+    END;
+    
+    SET v_batch_id = fn_get_next_batch_id();
+    CALL sp_log_etl_start('load_dim_diagnosis', v_batch_id, v_run_id);
+    
+    START TRANSACTION;
+        
+        -- Extract and categorize diagnoses
+        CREATE TEMPORARY TABLE tmp_diagnoses AS
+        SELECT 
+            diagnosis_id,
+            icd10_code,
+            icd10_description,
+            REPLACE(icd10_code, '.', '') AS icd10_code_short,
+            -- Categorize by ICD-10 chapter (first letter/letters)
+            CASE 
+                WHEN icd10_code LIKE 'A%' OR icd10_code LIKE 'B%' THEN 'Infectious and Parasitic Diseases'
+                WHEN icd10_code LIKE 'C%' OR icd10_code LIKE 'D0%' OR icd10_code LIKE 'D1%' OR icd10_code LIKE 'D2%' OR icd10_code LIKE 'D3%' OR icd10_code LIKE 'D4%' THEN 'Neoplasms'
+                WHEN icd10_code LIKE 'D5%' OR icd10_code LIKE 'D6%' OR icd10_code LIKE 'D7%' OR icd10_code LIKE 'D8%' THEN 'Blood and Immune Disorders'
+                WHEN icd10_code LIKE 'E%' THEN 'Endocrine, Nutritional and Metabolic'
+                WHEN icd10_code LIKE 'F%' THEN 'Mental and Behavioral Disorders'
+                WHEN icd10_code LIKE 'G%' THEN 'Nervous System'
+                WHEN icd10_code LIKE 'H0%' OR icd10_code LIKE 'H1%' OR icd10_code LIKE 'H2%' OR icd10_code LIKE 'H3%' OR icd10_code LIKE 'H4%' OR icd10_code LIKE 'H5%' THEN 'Eye and Adnexa'
+                WHEN icd10_code LIKE 'H6%' OR icd10_code LIKE 'H7%' OR icd10_code LIKE 'H8%' OR icd10_code LIKE 'H9%' THEN 'Ear and Mastoid'
+                WHEN icd10_code LIKE 'I%' THEN 'Circulatory System'
+                WHEN icd10_code LIKE 'J%' THEN 'Respiratory System'
+                WHEN icd10_code LIKE 'K%' THEN 'Digestive System'
+                WHEN icd10_code LIKE 'L%' THEN 'Skin and Subcutaneous Tissue'
+                WHEN icd10_code LIKE 'M%' THEN 'Musculoskeletal System'
+                WHEN icd10_code LIKE 'N%' THEN 'Genitourinary System'
+                WHEN icd10_code LIKE 'O%' THEN 'Pregnancy and Childbirth'
+                WHEN icd10_code LIKE 'P%' THEN 'Perinatal Conditions'
+                WHEN icd10_code LIKE 'Q%' THEN 'Congenital Malformations'
+                WHEN icd10_code LIKE 'R%' THEN 'Symptoms and Signs'
+                WHEN icd10_code LIKE 'S%' OR icd10_code LIKE 'T%' THEN 'Injury and Poisoning'
+                WHEN icd10_code LIKE 'V%' OR icd10_code LIKE 'W%' OR icd10_code LIKE 'X%' OR icd10_code LIKE 'Y%' THEN 'External Causes'
+                WHEN icd10_code LIKE 'Z%' THEN 'Health Status and Contact'
+                ELSE 'Other'
+            END AS diagnosis_category,
+            -- Body system
+            CASE 
+                WHEN icd10_code LIKE 'I%' THEN 'Cardiovascular'
+                WHEN icd10_code LIKE 'J%' THEN 'Respiratory'
+                WHEN icd10_code LIKE 'K%' THEN 'Digestive'
+                WHEN icd10_code LIKE 'N%' THEN 'Genitourinary'
+                WHEN icd10_code LIKE 'M%' THEN 'Musculoskeletal'
+                WHEN icd10_code LIKE 'G%' THEN 'Neurological'
+                WHEN icd10_code LIKE 'E%' THEN 'Endocrine'
+                WHEN icd10_code LIKE 'L%' THEN 'Integumentary'
+                ELSE 'Multiple/Other'
+            END AS body_system,
+            -- Chronic vs Acute (simplified logic)
+            CASE 
+                WHEN icd10_description LIKE '%chronic%' THEN TRUE
+                WHEN icd10_code IN ('I10', 'E11%', 'I50%', 'J44%', 'N18%') THEN TRUE
+                ELSE FALSE
+            END AS is_chronic,
+            CASE 
+                WHEN icd10_description LIKE '%acute%' THEN TRUE
+                ELSE FALSE
+            END AS is_acute
+        FROM oltp.diagnoses;
+        
+        SELECT COUNT(*) INTO v_rows_extracted FROM tmp_diagnoses;
+        
+        -- Update existing
+        UPDATE dim_diagnosis dd
+        INNER JOIN tmp_diagnoses td ON dd.diagnosis_id = td.diagnosis_id
+        SET 
+            dd.icd10_code = td.icd10_code,
+            dd.icd10_description = td.icd10_description,
+            dd.icd10_code_short = td.icd10_code_short,
+            dd.diagnosis_category = td.diagnosis_category,
+            dd.body_system = td.body_system,
+            dd.is_chronic = td.is_chronic,
+            dd.is_acute = td.is_acute
+        WHERE dd.diagnosis_key != -1;
+        
+        SET v_rows_updated = ROW_COUNT();
+        
+        -- Insert new
+        INSERT INTO dim_diagnosis (
+            diagnosis_id, icd10_code, icd10_description, icd10_code_short,
+            diagnosis_category, body_system, is_chronic, is_acute
+        )
+        SELECT 
+            td.diagnosis_id, td.icd10_code, td.icd10_description, td.icd10_code_short,
+            td.diagnosis_category, td.body_system, td.is_chronic, td.is_acute
+        FROM tmp_diagnoses td
+        LEFT JOIN dim_diagnosis dd ON td.diagnosis_id = dd.diagnosis_id
+        WHERE dd.diagnosis_key IS NULL;
+        
+        SET v_rows_inserted = ROW_COUNT();
+        
+        DROP TEMPORARY TABLE tmp_diagnoses;
+        
+        COMMIT;
+        
+        CALL sp_log_etl_complete(v_run_id, v_rows_extracted, v_rows_inserted, v_rows_updated, 'SUCCESS');
+        UPDATE etl_control SET last_successful_run = NOW() WHERE process_name = 'load_dim_diagnosis';
+    
+    SELECT CONCAT('dim_diagnosis loaded: ', v_rows_inserted, ' inserted, ', v_rows_updated, ' updated') AS result;
+END //
+
+DELIMITER ;
+
+
+
+
+-- 1.7: LOAD DIM_PROCEDURE
+-- Full refresh of procedure codes
+DELIMITER //
+
+CREATE PROCEDURE sp_load_dim_procedure()
+BEGIN
+    DECLARE v_batch_id INT;
+    DECLARE v_run_id INT;
+    DECLARE v_rows_extracted INT DEFAULT 0;
+    DECLARE v_rows_inserted INT DEFAULT 0;
+    DECLARE v_rows_updated INT DEFAULT 0;
+    
+    -- Exception handler
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        GET DIAGNOSTICS CONDITION 1 @text = MESSAGE_TEXT;
+        INSERT INTO etl_error_log (etl_batch_id, process_name, error_severity, error_message)
+        VALUES (v_batch_id, 'load_dim_procedure', 'ERROR', @text);
+        UPDATE etl_run_log SET status = 'FAILED', end_time = NOW() WHERE run_id = v_run_id;
+        ROLLBACK;
+    END;
+    
+    SET v_batch_id = fn_get_next_batch_id();
+    CALL sp_log_etl_start('load_dim_procedure', v_batch_id, v_run_id);
+    
+    START TRANSACTION;
+        
+        -- Extract and categorize procedures
+        CREATE TEMPORARY TABLE tmp_procedures AS
+        SELECT 
+            procedure_id,
+            cpt_code,
+            cpt_description,
+            cpt_code AS cpt_code_short,
+            -- Categorize by CPT code range
+            CASE 
+                WHEN cpt_code BETWEEN '99201' AND '99499' THEN 'Evaluation and Management'
+                WHEN cpt_code BETWEEN '00100' AND '01999' THEN 'Anesthesia'
+                WHEN cpt_code BETWEEN '10000' AND '69999' THEN 'Surgery'
+                WHEN cpt_code BETWEEN '70000' AND '79999' THEN 'Radiology'
+                WHEN cpt_code BETWEEN '80000' AND '89999' THEN 'Pathology and Laboratory'
+                WHEN cpt_code BETWEEN '90000' AND '99199' THEN 'Medicine'
+                ELSE 'Other'
+            END AS procedure_category,
+            -- Procedure type
+            CASE 
+                WHEN cpt_code BETWEEN '99201' AND '99499' THEN 'Diagnostic'
+                WHEN cpt_code BETWEEN '70000' AND '79999' THEN 'Diagnostic'
+                WHEN cpt_code BETWEEN '80000' AND '89999' THEN 'Diagnostic'
+                WHEN cpt_code BETWEEN '10000' AND '69999' THEN 'Therapeutic'
+                WHEN cpt_description LIKE '%prevent%' THEN 'Preventive'
+                ELSE 'Other'
+            END AS procedure_type,
+            -- Surgical flag
+            CASE 
+                WHEN cpt_code BETWEEN '10000' AND '69999' THEN TRUE
+                ELSE FALSE
+            END AS is_surgical,
+            -- Anesthesia flag
+            CASE 
+                WHEN cpt_code BETWEEN '00100' AND '01999' THEN TRUE
+                WHEN cpt_description LIKE '%anesthe%' THEN TRUE
+                ELSE FALSE
+            END AS requires_anesthesia,
+            -- Invasive flag
+            CASE 
+                WHEN cpt_code BETWEEN '10000' AND '69999' THEN TRUE
+                WHEN cpt_description LIKE '%incision%' OR cpt_description LIKE '%excision%' THEN TRUE
+                ELSE FALSE
+            END AS is_invasive
+        FROM oltp.procedures;
+        
+        SELECT COUNT(*) INTO v_rows_extracted FROM tmp_procedures;
+        
+        -- Update existing
+        UPDATE dim_procedure dp
+        INNER JOIN tmp_procedures tp ON dp.procedure_id = tp.procedure_id
+        SET 
+            dp.cpt_code = tp.cpt_code,
+            dp.cpt_description = tp.cpt_description,
+            dp.cpt_code_short = tp.cpt_code_short,
+            dp.procedure_category = tp.procedure_category,
+            dp.procedure_type = tp.procedure_type,
+            dp.is_surgical = tp.is_surgical,
+            dp.requires_anesthesia = tp.requires_anesthesia,
+            dp.is_invasive = tp.is_invasive
+        WHERE dp.procedure_key != -1;
+        
+        SET v_rows_updated = ROW_COUNT();
+        
+        -- Insert new
+        INSERT INTO dim_procedure (
+            procedure_id, cpt_code, cpt_description, cpt_code_short,
+            procedure_category, procedure_type, is_surgical, requires_anesthesia, is_invasive
+        )
+        SELECT 
+            tp.procedure_id, tp.cpt_code, tp.cpt_description, tp.cpt_code_short,
+            tp.procedure_category, tp.procedure_type, tp.is_surgical, tp.requires_anesthesia, tp.is_invasive
+        FROM tmp_procedures tp
+        LEFT JOIN dim_procedure dp ON tp.procedure_id = dp.procedure_id
+        WHERE dp.procedure_key IS NULL;
+        
+        SET v_rows_inserted = ROW_COUNT();
+        
+        DROP TEMPORARY TABLE tmp_procedures;
+        
+        COMMIT;
+        
+        CALL sp_log_etl_complete(v_run_id, v_rows_extracted, v_rows_inserted, v_rows_updated, 'SUCCESS');
+        UPDATE etl_control SET last_successful_run = NOW() WHERE process_name = 'load_dim_procedure';
+    
+    SELECT CONCAT('dim_procedure loaded: ', v_rows_inserted, ' inserted, ', v_rows_updated, ' updated') AS result;
+END //
+
+DELIMITER ;
+
+
+
+-- 1.8: LOAD DIM_ENCOUNTER_TYPE
+-- One-time static load
+DELIMITER //
+
+CREATE PROCEDURE sp_load_dim_encounter_type()
+BEGIN
+    DECLARE v_batch_id INT;
+    DECLARE v_run_id INT;
+    
+    -- Exception handler
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        GET DIAGNOSTICS CONDITION 1 @text = MESSAGE_TEXT;
+        INSERT INTO etl_error_log (etl_batch_id, process_name, error_severity, error_message)
+        VALUES (v_batch_id, 'load_dim_encounter_type', 'ERROR', @text);
+        UPDATE etl_run_log SET status = 'FAILED', end_time = NOW() WHERE run_id = v_run_id;
+        ROLLBACK;
+    END;
+    
+    SET v_batch_id = fn_get_next_batch_id();
+    CALL sp_log_etl_start('load_dim_encounter_type', v_batch_id, v_run_id);
+    
+    START TRANSACTION;
+        
+        -- Delete existing (except unknown)
+        DELETE FROM dim_encounter_type WHERE encounter_type_key != -1;
+        
+        -- Insert predefined encounter types
+        INSERT INTO dim_encounter_type (
+            encounter_type, encounter_type_code, encounter_type_category,
+            expected_duration_hours, is_admission, is_same_day, requires_bed
+        ) VALUES
+        ('Inpatient', 'IP', 'Acute', 96, TRUE, FALSE, TRUE),
+        ('Outpatient', 'OP', 'Ambulatory', 2, FALSE, TRUE, FALSE),
+        ('ER', 'ER', 'Emergency', 8, FALSE, FALSE, FALSE),
+        ('Observation', 'OBS', 'Acute', 24, TRUE, FALSE, TRUE),
+        ('Telehealth', 'TH', 'Virtual', 0.5, FALSE, TRUE, FALSE),
+        ('Day Surgery', 'DS', 'Surgical', 8, FALSE, TRUE, FALSE);
+        
+        COMMIT;
+        
+        CALL sp_log_etl_complete(v_run_id, 6, 6, 0, 'SUCCESS');
+        UPDATE etl_control SET last_successful_run = NOW() WHERE process_name = 'load_dim_encounter_type';
+    
+    SELECT 'dim_encounter_type loaded: 6 types' AS result;
+END //
+
+DELIMITER ;
+
+
+
+
+
+-- PHASE 2: FACT TABLE LOAD PROCEDURES
+
+
+-- 2.1: LOAD FACT_ENCOUNTERS
+-- Incremental load with 7-day lookback window
+-- Includes complex readmission logic
+DELIMITER //
+
+CREATE PROCEDURE sp_load_fact_encounters(
+    IN p_load_date DATE
+)
+BEGIN
+    DECLARE v_batch_id INT;
+    DECLARE v_run_id INT;
+    DECLARE v_rows_extracted INT DEFAULT 0;
+    DECLARE v_rows_inserted INT DEFAULT 0;
+    DECLARE v_lookback_days INT DEFAULT 7;
+    DECLARE v_lookback_start DATE;
+    
+    -- Exception handler
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        GET DIAGNOSTICS CONDITION 1 @text = MESSAGE_TEXT;
+        INSERT INTO etl_error_log (etl_batch_id, process_name, error_severity, error_message)
+        VALUES (v_batch_id, 'load_fact_encounters', 'ERROR', @text);
+        UPDATE etl_run_log SET status = 'FAILED', end_time = NOW() WHERE run_id = v_run_id;
+        ROLLBACK;
+    END;
+    
+    -- Set lookback window (for late-arriving facts)
+    SET v_lookback_start = DATE_SUB(p_load_date, INTERVAL v_lookback_days DAY);
+    
+    SET v_batch_id = fn_get_next_batch_id();
+    CALL sp_log_etl_start('load_fact_encounters', v_batch_id, v_run_id);
+    
+    START TRANSACTION;
+        
+        -- STEP 1: Extract encounters from OLTP
+        CREATE TEMPORARY TABLE tmp_encounters_stage AS
+        SELECT 
+            e.encounter_id,
+            e.patient_id,
+            e.provider_id,
+            e.encounter_type,
+            e.encounter_date,
+            e.discharge_date,
+            e.department_id,
+            p.specialty_id
+        FROM oltp.encounters e
+        INNER JOIN oltp.providers p ON e.provider_id = p.provider_id
+        WHERE DATE(e.encounter_date) BETWEEN v_lookback_start AND p_load_date
+            AND e.encounter_id NOT IN (
+                SELECT encounter_id FROM fact_encounters
+            );
+        
+        SELECT COUNT(*) INTO v_rows_extracted FROM tmp_encounters_stage;
+        
+
+        -- STEP 2: Get dimension surrogate keys
+
+        CREATE TEMPORARY TABLE tmp_encounters_transformed AS
+        SELECT 
+            se.encounter_id,
+            -- Date keys
+            COALESCE(CAST(DATE_FORMAT(se.encounter_date, '%Y%m%d') AS UNSIGNED), -1) AS date_key,
+            CASE 
+                WHEN se.discharge_date IS NOT NULL 
+                THEN CAST(DATE_FORMAT(se.discharge_date, '%Y%m%d') AS UNSIGNED)
+                ELSE NULL
+            END AS discharge_date_key,
+            -- Dimension keys
+            COALESCE(dp.patient_key, -1) AS patient_key,
+            COALESCE(dpr.provider_key, -1) AS provider_key,
+            COALESCE(ds.specialty_key, -1) AS specialty_key,
+            COALESCE(dd.department_key, -1) AS department_key,
+            COALESCE(det.encounter_type_key, -1) AS encounter_type_key,
+            -- Original timestamps
+            se.encounter_date,
+            se.discharge_date,
+            -- Length of stay calculation
+            CASE 
+                WHEN se.discharge_date IS NOT NULL THEN
+                    TIMESTAMPDIFF(HOUR, se.encounter_date, se.discharge_date)
+                ELSE NULL
+            END AS length_of_stay_hours,
+            CASE 
+                WHEN se.discharge_date IS NOT NULL THEN
+                    TIMESTAMPDIFF(HOUR, se.encounter_date, se.discharge_date) / 24.0
+                ELSE NULL
+            END AS length_of_stay_days
+        FROM tmp_encounters_stage se
+        LEFT JOIN dim_patient dp ON se.patient_id = dp.patient_id AND dp.is_current = TRUE
+        LEFT JOIN dim_provider dpr ON se.provider_id = dpr.provider_id AND dpr.is_current = TRUE
+        LEFT JOIN dim_specialty ds ON se.specialty_id = ds.specialty_id
+        LEFT JOIN dim_department dd ON se.department_id = dd.department_id
+        LEFT JOIN dim_encounter_type det ON se.encounter_type = det.encounter_type;
+        
+    
+        -- STEP 3: Add diagnosis counts
+
+        ALTER TABLE tmp_encounters_transformed ADD COLUMN diagnosis_count INT DEFAULT 0;
+        
+        UPDATE tmp_encounters_transformed tet
+        LEFT JOIN (
+            SELECT encounter_id, COUNT(*) AS diag_count
+            FROM oltp.encounter_diagnoses
+            WHERE encounter_id IN (SELECT encounter_id FROM tmp_encounters_stage)
+            GROUP BY encounter_id
+        ) dc ON tet.encounter_id = dc.encounter_id
+        SET tet.diagnosis_count = COALESCE(dc.diag_count, 0);
+        
+    
+        -- STEP 4: Add procedure counts
+
+        ALTER TABLE tmp_encounters_transformed ADD COLUMN procedure_count INT DEFAULT 0;
+        
+        UPDATE tmp_encounters_transformed tet
+        LEFT JOIN (
+            SELECT encounter_id, COUNT(*) AS proc_count
+            FROM oltp.encounter_procedures
+            WHERE encounter_id IN (SELECT encounter_id FROM tmp_encounters_stage)
+            GROUP BY encounter_id
+        ) pc ON tet.encounter_id = pc.encounter_id
+        SET tet.procedure_count = COALESCE(pc.proc_count, 0);
+        
+
+        -- STEP 5: Add primary diagnosis
+
+        ALTER TABLE tmp_encounters_transformed ADD COLUMN primary_diagnosis_key INT;
+        
+        UPDATE tmp_encounters_transformed tet
+        LEFT JOIN oltp.encounter_diagnoses ed ON tet.encounter_id = ed.encounter_id AND ed.diagnosis_sequence = 1
+        LEFT JOIN dim_diagnosis dd ON ed.diagnosis_id = dd.diagnosis_id
+        SET tet.primary_diagnosis_key = dd.diagnosis_key;
+        
+    
+        -- STEP 6: Add financial data
+
+        ALTER TABLE tmp_encounters_transformed 
+        ADD COLUMN claim_amount DECIMAL(12,2) DEFAULT 0.00,
+        ADD COLUMN allowed_amount DECIMAL(12,2) DEFAULT 0.00,
+        ADD COLUMN claim_status VARCHAR(50),
+        ADD COLUMN claim_date DATE;
+        
+        UPDATE tmp_encounters_transformed tet
+        LEFT JOIN oltp.billing b ON tet.encounter_id = b.encounter_id
+        SET 
+            tet.claim_amount = COALESCE(b.claim_amount, 0.00),
+            tet.allowed_amount = COALESCE(b.allowed_amount, 0.00),
+            tet.claim_status = b.claim_status,
+            tet.claim_date = b.claim_date;
+        
+    
+        -- STEP 7: Calculate readmission metrics
+        -- Complex self-join logic
+        
+        
+        -- Add columns for readmission analysis
+        ALTER TABLE tmp_encounters_transformed 
+        ADD COLUMN is_readmission_7day BOOLEAN DEFAULT FALSE,
+        ADD COLUMN is_readmission_30day BOOLEAN DEFAULT FALSE,
+        ADD COLUMN is_readmission_90day BOOLEAN DEFAULT FALSE,
+        ADD COLUMN days_since_last_encounter INT,
+        ADD COLUMN previous_encounter_key BIGINT,
+        ADD COLUMN encounter_sequence_number INT,
+        ADD COLUMN is_first_visit BOOLEAN DEFAULT FALSE;
+        
+        -- Find previous inpatient encounters for each patient
+        CREATE TEMPORARY TABLE tmp_previous_encounters AS
+        SELECT 
+            curr.encounter_id AS current_encounter_id,
+            curr.patient_key,
+            curr.encounter_date AS current_encounter_date,
+            prev.encounter_key AS previous_encounter_key,
+            prev.discharge_date AS previous_discharge_date,
+            DATEDIFF(curr.encounter_date, prev.discharge_date) AS days_since_discharge
+        FROM tmp_encounters_transformed curr
+        INNER JOIN fact_encounters prev 
+            ON curr.patient_key = prev.patient_key
+            AND prev.encounter_date < curr.encounter_date
+            AND prev.encounter_type_key = (SELECT encounter_type_key FROM dim_encounter_type WHERE encounter_type = 'Inpatient')
+            AND prev.discharge_date IS NOT NULL
+        WHERE NOT EXISTS (
+            -- Get only the MOST RECENT previous encounter
+            SELECT 1 
+            FROM fact_encounters prev2
+            WHERE prev2.patient_key = curr.patient_key
+                AND prev2.encounter_date < curr.encounter_date
+                AND prev2.encounter_date > prev.encounter_date
+        );
+        
+        -- Update readmission flags
+        UPDATE tmp_encounters_transformed tet
+        LEFT JOIN tmp_previous_encounters pe ON tet.encounter_id = pe.current_encounter_id
+        INNER JOIN dim_encounter_type det ON tet.encounter_type_key = det.encounter_type_key
+        SET 
+            tet.days_since_last_encounter = pe.days_since_discharge,
+            tet.previous_encounter_key = pe.previous_encounter_key,
+            tet.is_readmission_7day = CASE 
+                WHEN det.encounter_type = 'Inpatient' AND pe.days_since_discharge <= 7 THEN TRUE 
+                ELSE FALSE 
+            END,
+            tet.is_readmission_30day = CASE 
+                WHEN det.encounter_type = 'Inpatient' AND pe.days_since_discharge <= 30 THEN TRUE 
+                ELSE FALSE 
+            END,
+            tet.is_readmission_90day = CASE 
+                WHEN det.encounter_type = 'Inpatient' AND pe.days_since_discharge <= 90 THEN TRUE 
+                ELSE FALSE 
+            END;
+        
+        -- Calculate encounter sequence number for each patient
+        CREATE TEMPORARY TABLE tmp_encounter_sequence AS
+        SELECT 
+            t.encounter_id,
+            t.patient_key,
+            COUNT(f.encounter_key) + 1 AS sequence_number
+        FROM tmp_encounters_transformed t
+        LEFT JOIN fact_encounters f ON t.patient_key = f.patient_key AND f.encounter_date < t.encounter_date
+        GROUP BY t.encounter_id, t.patient_key;
+        
+        UPDATE tmp_encounters_transformed tet
+        INNER JOIN tmp_encounter_sequence seq ON tet.encounter_id = seq.encounter_id
+        SET 
+            tet.encounter_sequence_number = seq.sequence_number,
+            tet.is_first_visit = CASE WHEN seq.sequence_number = 1 THEN TRUE ELSE FALSE END;
+        
+        DROP TEMPORARY TABLE tmp_previous_encounters;
+        DROP TEMPORARY TABLE tmp_encounter_sequence;
+        
+
+        -- STEP 8: Load into fact table
+
+        INSERT INTO fact_encounters (
+            encounter_id, date_key, discharge_date_key, patient_key, provider_key,
+            specialty_key, department_key, encounter_type_key, encounter_date, discharge_date,
+            diagnosis_count, procedure_count, primary_diagnosis_key,
+            claim_amount, allowed_amount, claim_status, claim_date,
+            length_of_stay_hours, length_of_stay_days,
+            is_readmission_7day, is_readmission_30day, is_readmission_90day,
+            days_since_last_encounter, previous_encounter_key,
+            encounter_sequence_number, is_first_visit,
+            etl_batch_id
+        )
+        SELECT 
+            encounter_id, date_key, discharge_date_key, patient_key, provider_key,
+            specialty_key, department_key, encounter_type_key, encounter_date, discharge_date,
+            diagnosis_count, procedure_count, primary_diagnosis_key,
+            claim_amount, allowed_amount, claim_status, claim_date,
+            length_of_stay_hours, length_of_stay_days,
+            is_readmission_7day, is_readmission_30day, is_readmission_90day,
+            days_since_last_encounter, previous_encounter_key,
+            encounter_sequence_number, is_first_visit,
+            v_batch_id
+        FROM tmp_encounters_transformed;
+        
+        SET v_rows_inserted = ROW_COUNT();
+        
+        -- Cleanup
+        DROP TEMPORARY TABLE tmp_encounters_stage;
+        DROP TEMPORARY TABLE tmp_encounters_transformed;
+        
+        COMMIT;
+        
+        CALL sp_log_etl_complete(v_run_id, v_rows_extracted, v_rows_inserted, 0, 'SUCCESS');
+        UPDATE etl_control 
+        SET last_successful_run = NOW(), last_extract_date = p_load_date 
+        WHERE process_name = 'load_fact_encounters';
+    
+    SELECT CONCAT('fact_encounters loaded: ', v_rows_inserted, ' rows for date ', p_load_date) AS result;
+END //
+
+DELIMITER ;
+
+
+
+-- PHASE 3: BRIDGE TABLE LOAD PROCEDURES
+
+
+-- 3.1: LOAD BRIDGE_ENCOUNTER_DIAGNOSES
+-- Incremental load matching fact table
+DELIMITER //
+
+CREATE PROCEDURE sp_load_bridge_encounter_diagnoses(
+    IN p_load_date DATE
+)
+BEGIN
+    DECLARE v_batch_id INT;
+    DECLARE v_run_id INT;
+    DECLARE v_rows_inserted INT DEFAULT 0;
+    DECLARE v_lookback_days INT DEFAULT 7;
+    DECLARE v_lookback_start DATE;
+    
+    -- Exception handler
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        GET DIAGNOSTICS CONDITION 1 @text = MESSAGE_TEXT;
+        INSERT INTO etl_error_log (etl_batch_id, process_name, error_severity, error_message)
+        VALUES (v_batch_id, 'load_bridge_encounter_diagnoses', 'ERROR', @text);
+        UPDATE etl_run_log SET status = 'FAILED', end_time = NOW() WHERE run_id = v_run_id;
+        ROLLBACK;
+    END;
+    
+    SET v_lookback_start = DATE_SUB(p_load_date, INTERVAL v_lookback_days DAY);
+    SET v_batch_id = fn_get_next_batch_id();
+    CALL sp_log_etl_start('load_bridge_encounter_diagnoses', v_batch_id, v_run_id);
+    
+    START TRANSACTION;
+        
+        -- Get encounter_keys for recently loaded encounters
+        CREATE TEMPORARY TABLE tmp_recent_encounters AS
+        SELECT encounter_key, encounter_id
+        FROM fact_encounters
+        WHERE DATE(encounter_date) BETWEEN v_lookback_start AND p_load_date
+            AND encounter_key NOT IN (
+                SELECT DISTINCT encounter_key FROM bridge_encounter_diagnoses
+            );
+        
+        -- Extract diagnosis relationships
+        CREATE TEMPORARY TABLE tmp_encounter_diagnoses AS
+        SELECT 
+            tre.encounter_key,
+            COALESCE(dd.diagnosis_key, -1) AS diagnosis_key,
+            ed.diagnosis_sequence,
+            ROW_NUMBER() OVER (PARTITION BY tre.encounter_key ORDER BY ed.diagnosis_sequence) AS diagnosis_group_key,
+            ed.present_on_admission
+        FROM oltp.encounter_diagnoses ed
+        INNER JOIN tmp_recent_encounters tre ON ed.encounter_id = tre.encounter_id
+        LEFT JOIN dim_diagnosis dd ON ed.diagnosis_id = dd.diagnosis_id;
+        
+        -- Load bridge table
+        INSERT INTO bridge_encounter_diagnoses (
+            encounter_key, diagnosis_key, diagnosis_sequence, diagnosis_group_key, present_on_admission
+        )
+        SELECT encounter_key, diagnosis_key, diagnosis_sequence, diagnosis_group_key, present_on_admission
+        FROM tmp_encounter_diagnoses;
+        
+        SET v_rows_inserted = ROW_COUNT();
+        
+        DROP TEMPORARY TABLE tmp_recent_encounters;
+        DROP TEMPORARY TABLE tmp_encounter_diagnoses;
+        
+        COMMIT;
+        
+        CALL sp_log_etl_complete(v_run_id, v_rows_inserted, v_rows_inserted, 0, 'SUCCESS');
+        UPDATE etl_control SET last_successful_run = NOW() WHERE process_name = 'load_bridge_encounter_diagnoses';
+    
+    SELECT CONCAT('bridge_encounter_diagnoses loaded: ', v_rows_inserted, ' rows') AS result;
+END //
+
+DELIMITER ;
+
+-- 3.2: LOAD BRIDGE_ENCOUNTER_PROCEDURES
+-- Incremental load matching fact table
+DELIMITER //
+
+CREATE PROCEDURE sp_load_bridge_encounter_procedures(
+IN p_load_date DATE
+)
+BEGIN
+DECLARE v_batch_id INT;
+DECLARE v_run_id INT;
+DECLARE v_rows_inserted INT DEFAULT 0;
+DECLARE v_lookback_days INT DEFAULT 7;
+DECLARE v_lookback_start DATE;
+
+-- Exception handler
+DECLARE EXIT HANDLER FOR SQLEXCEPTION
+BEGIN
+    GET DIAGNOSTICS CONDITION 1 @text = MESSAGE_TEXT;
+    INSERT INTO etl_error_log (etl_batch_id, process_name, error_severity, error_message)
+    VALUES (v_batch_id, 'load_bridge_encounter_procedures', 'ERROR', @text);
+    UPDATE etl_run_log SET status = 'FAILED', end_time = NOW() WHERE run_id = v_run_id;
+    ROLLBACK;
+END;
+
+SET v_lookback_start = DATE_SUB(p_load_date, INTERVAL v_lookback_days DAY);
+SET v_batch_id = fn_get_next_batch_id();
+CALL sp_log_etl_start('load_bridge_encounter_procedures', v_batch_id, v_run_id);
+
+START TRANSACTION;
+    
+    -- Get encounter_keys for recently loaded encounters
+    CREATE TEMPORARY TABLE tmp_recent_encounters AS
+    SELECT encounter_key, encounter_id
+    FROM fact_encounters
+    WHERE DATE(encounter_date) BETWEEN v_lookback_start AND p_load_date
+        AND encounter_key NOT IN (
+            SELECT DISTINCT encounter_key FROM bridge_encounter_procedures
+        );
+    
+    -- Extract procedure relationships
+    CREATE TEMPORARY TABLE tmp_encounter_procedures AS
+    SELECT 
+        tre.encounter_key,
+        COALESCE(dp.procedure_key, -1) AS procedure_key,
+        ep.procedure_date,
+        ROW_NUMBER() OVER (PARTITION BY tre.encounter_key ORDER BY ep.procedure_date, ep.procedure_id) AS procedure_sequence,
+        ROW_NUMBER() OVER (PARTITION BY tre.encounter_key ORDER BY ep.procedure_date, ep.procedure_id) AS procedure_group_key
+    FROM oltp.encounter_procedures ep
+    INNER JOIN tmp_recent_encounters tre ON ep.encounter_id = tre.encounter_id
+    LEFT JOIN dim_procedure dp ON ep.procedure_id = dp.procedure_id;
+    
+    -- Load bridge table
+    INSERT INTO bridge_encounter_procedures (
+        encounter_key, procedure_key, procedure_date, procedure_sequence, procedure_group_key
+    )
+    SELECT encounter_key, procedure_key, procedure_date, procedure_sequence, procedure_group_key
+    FROM tmp_encounter_procedures;
+    
+    SET v_rows_inserted = ROW_COUNT();
+    
+    DROP TEMPORARY TABLE tmp_recent_encounters;
+    DROP TEMPORARY TABLE tmp_encounter_procedures;
+    
+    COMMIT;
+    
+    CALL sp_log_etl_complete(v_run_id, v_rows_inserted, v_rows_inserted, 0, 'SUCCESS');
+    UPDATE etl_control SET last_successful_run = NOW() WHERE process_name = 'load_bridge_encounter_procedures';
+    
+    SELECT CONCAT('bridge_encounter_procedures loaded: ', v_rows_inserted, ' rows') AS result;
+END //
+
+DELIMITER ;
+
+
+
+-- PHASE 4: AGGREGATE TABLE PROCEDURES
+
+-- MASTER ETL PROCEDURE
+-- Orchestrates all ETL processes in correct order
+
+DELIMITER //
+
+CREATE PROCEDURE sp_master_etl(
+IN p_load_date DATE
+)
+BEGIN
+DECLARE v_start_time TIMESTAMP DEFAULT NOW();
+DECLARE v_batch_id INT;
+DECLARE v_status VARCHAR(50) DEFAULT 'SUCCESS';
+DECLARE v_error_message TEXT;
+
+-- Exception handler
+DECLARE EXIT HANDLER FOR SQLEXCEPTION
+BEGIN
+        GET DIAGNOSTICS CONDITION 1 v_error_message = MESSAGE_TEXT;
+        SET v_status = 'FAILED';
+        
+        INSERT INTO etl_error_log (etl_batch_id, process_name, error_severity, error_message)
+        VALUES (v_batch_id, 'sp_master_etl', 'CRITICAL', v_error_message);
+        
+        INSERT INTO etl_run_log (process_name, etl_batch_id, start_time, end_time, status, error_message)
+        VALUES ('sp_master_etl', v_batch_id, v_start_time, NOW(), 'FAILED', v_error_message);
+        
+        SELECT 'ETL FAILED - Check etl_error_log for details' AS status, v_error_message AS error;
+    END;
+    
+    -- Initialize batch ID
+    SET v_batch_id = fn_get_next_batch_id();
+    
+    SELECT CONCAT('Starting Master ETL for date: ', p_load_date) AS status;
+    SELECT '========================================' AS status;
+    
+    -- PHASE 1: Load Dimensions (order matters for FK dependencies)
+    SELECT 'PHASE 1: Loading Dimension Tables' AS status;
+    
+    -- One-time loads (skip if already loaded)
+    IF NOT EXISTS (SELECT 1 FROM dim_date WHERE date_key != -1 LIMIT 1) THEN
+        CALL sp_load_dim_date();
+    END IF;
+    
+    IF NOT EXISTS (SELECT 1 FROM dim_encounter_type WHERE encounter_type_key != -1 LIMIT 1) THEN
+        CALL sp_load_dim_encounter_type();
+    END IF;
+    
+    -- Daily dimension loads
+    CALL sp_load_dim_specialty();
+    CALL sp_load_dim_department();
+    CALL sp_load_dim_diagnosis();
+    CALL sp_load_dim_procedure();
+    CALL sp_load_dim_patient();
+    CALL sp_load_dim_provider();  -- Must run after specialty & department
+    
+    SELECT '========================================' AS status;
+    SELECT 'PHASE 2: Loading Fact Table' AS status;
+    
+    CALL sp_load_fact_encounters(p_load_date);
+    
+    SELECT '========================================' AS status;
+    SELECT 'PHASE 3: Loading Bridge Tables' AS status;
+    
+    CALL sp_load_bridge_encounter_diagnoses(p_load_date);
+    CALL sp_load_bridge_encounter_procedures(p_load_date);
+    
+    SELECT '========================================' AS status;
+    SELECT 'PHASE 4: Refreshing Aggregate Tables' AS status;
+    
+    -- Refresh monthly summary for current month (procedure not yet implemented)
+    -- CALL sp_refresh_monthly_summary(YEAR(p_load_date), MONTH(p_load_date));
+    
+    -- Log successful completion
+    INSERT INTO etl_run_log (
+        process_name, etl_batch_id, start_time, end_time, status, duration_seconds
+    ) VALUES (
+        'sp_master_etl', v_batch_id, v_start_time, NOW(), 'SUCCESS',
+        TIMESTAMPDIFF(SECOND, v_start_time, NOW())
+    );
+    
+    SELECT '========================================' AS status;
+    SELECT 'ETL COMPLETED SUCCESSFULLY!' AS status;
+    SELECT CONCAT('Duration: ', TIMESTAMPDIFF(SECOND, v_start_time, NOW()), ' seconds') AS status;
+    SELECT '========================================' AS status;
+END //
+
+DELIMITER ;
+
+
+-- DATA QUALITY CHECK PROCEDURES
+-- Data Quality Validation
+-- Run after ETL to verify data integrity
+
+DELIMITER //
+
+CREATE PROCEDURE sp_validate_data_quality(
+IN p_batch_id INT
+)
+BEGIN
+DECLARE v_check_status VARCHAR(20);
+
+SELECT 'Running Data Quality Checks...' AS status;
+
+-- Check 1: Row count reconciliation
+INSERT INTO etl_data_quality_log (etl_batch_id, check_name, check_status, expected_value, actual_value, passed)
+SELECT 
+    p_batch_id,
+    'Fact encounters vs OLTP encounters',
+    'INFO',
+    COUNT(*) AS expected_value,
+    (SELECT COUNT(*) FROM fact_encounters) AS actual_value,
+    CASE WHEN COUNT(*) <= (SELECT COUNT(*) FROM fact_encounters) THEN TRUE ELSE FALSE END
+FROM oltp.encounters;
+
+-- Check 2: No NULL foreign keys (except allowed ones)
+INSERT INTO etl_data_quality_log (etl_batch_id, check_name, check_status, expected_value, actual_value, passed)
+SELECT 
+    p_batch_id,
+    'Fact table - No invalid foreign keys',
+    'CRITICAL',
+    '0',
+    COUNT(*),
+    CASE WHEN COUNT(*) = 0 THEN TRUE ELSE FALSE END
+FROM fact_encounters
+WHERE date_key IS NULL OR date_key = 0
+    OR patient_key IS NULL OR patient_key = 0
+    OR provider_key IS NULL OR provider_key = 0
+    OR specialty_key IS NULL OR specialty_key = 0
+    OR department_key IS NULL OR department_key = 0
+    OR encounter_type_key IS NULL OR encounter_type_key = 0;
+
+-- Check 3: Financial data consistency
+INSERT INTO etl_data_quality_log (etl_batch_id, check_name, check_status, expected_value, actual_value, passed, details)
+SELECT 
+    p_batch_id,
+    'Financial data - Allowed <= Claim amount',
+    'WARNING',
+    '0',
+    COUNT(*),
+    CASE WHEN COUNT(*) = 0 THEN TRUE ELSE FALSE END,
+    'Records where allowed_amount > claim_amount'
+FROM fact_encounters
+WHERE allowed_amount > claim_amount;
+
+-- Check 4: Date integrity
+INSERT INTO etl_data_quality_log (etl_batch_id, check_name, check_status, expected_value, actual_value, passed)
+SELECT 
+    p_batch_id,
+    'Date integrity - Discharge after encounter',
+    'CRITICAL',
+    '0',
+    COUNT(*),
+    CASE WHEN COUNT(*) = 0 THEN TRUE ELSE FALSE END
+FROM fact_encounters
+WHERE discharge_date IS NOT NULL
+    AND discharge_date < encounter_date;
+
+-- Check 5: Readmission logic validation
+INSERT INTO etl_data_quality_log (etl_batch_id, check_name, check_status, expected_value, actual_value, passed, details)
+SELECT 
+    p_batch_id,
+    'Readmission logic - 7day subset of 30day',
+    'WARNING',
+    '0',
+    COUNT(*),
+    CASE WHEN COUNT(*) = 0 THEN TRUE ELSE FALSE END,
+    'Records where is_readmission_7day = TRUE but is_readmission_30day = FALSE'
+FROM fact_encounters
+WHERE is_readmission_7day = TRUE
+    AND is_readmission_30day = FALSE;
+
+-- Summary
+SELECT 
+    check_name,
+    check_status,
+    expected_value,
+    actual_value,
+    CASE WHEN passed THEN 'PASS' ELSE 'FAIL' END AS result,
+    details
+FROM etl_data_quality_log
+WHERE etl_batch_id = p_batch_id
+ORDER BY 
+    CASE check_status 
+        WHEN 'CRITICAL' THEN 1
+        WHEN 'WARNING' THEN 2
+        ELSE 3
+    END,
+    check_name;
+
+-- Overall status
+SELECT 
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM etl_data_quality_log WHERE etl_batch_id = p_batch_id AND passed = FALSE AND check_status = 'CRITICAL') 
+        THEN 'CRITICAL ISSUES FOUND'
+        WHEN EXISTS (SELECT 1 FROM etl_data_quality_log WHERE etl_batch_id = p_batch_id AND passed = FALSE AND check_status = 'WARNING')
+        THEN 'WARNINGS FOUND'
+        ELSE 'ALL CHECKS PASSED'
+    END AS overall_status;
+
+END //
+
+DELIMITER ;
+
+
+
+-- ETL MONITORING AND UTILITIES
+
+-- View recent ETL runs
+CREATE OR REPLACE VIEW vw_etl_run_history AS
+SELECT
+run_id,
+process_name,
+etl_batch_id,
+start_time,
+end_time,
+duration_seconds,
+status,
+rows_extracted,
+rows_inserted,
+rows_updated,
+CASE
+WHEN duration_seconds < 60 THEN CONCAT(duration_seconds, 's')
+WHEN duration_seconds < 3600 THEN CONCAT(FLOOR(duration_seconds/60), 'm ', MOD(duration_seconds, 60), 's')
+ELSE CONCAT(FLOOR(duration_seconds/3600), 'h ', FLOOR(MOD(duration_seconds, 3600)/60), 'm')
+END AS duration_formatted
+FROM etl_run_log
+ORDER BY start_time DESC
+LIMIT 100;
+
