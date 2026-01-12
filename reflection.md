@@ -25,10 +25,10 @@
   - Query optimizer struggles with deep JOIN trees
 
 - Star Schema Solution:
-- Direct foreign key relationships from fact to dimensions
-- Example: `fact_encounters → dim_specialty` (2 tables, 1 JOIN)
-- Denormalization eliminates intermediate JOINs
-- Specialty name directly accessible via single JOIN
+  - Direct foreign key relationships from fact to dimensions
+  - Example: `fact_encounters → dim_specialty` (2 tables, 1 JOIN)
+  - Denormalization eliminates intermediate JOINs
+  - Specialty name directly accessible via single JOIN
 
 Impact: Reduced JOIN count by 30-50% across all queries.
 
