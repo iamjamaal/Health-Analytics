@@ -237,4 +237,3 @@ Bottlenecks Identified:
 
 Root Cause:
 Normalization separates financial data (billing) from context (specialty via encounters→providers). Every financial report requires expensive JOINs to add context. No summary tables exist for common time-period aggregations (monthly, quarterly revenue).
-git commit -m "Add query analytics documentation"git commit -m "Add query analytics documentation"
