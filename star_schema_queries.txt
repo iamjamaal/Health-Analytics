@@ -18,7 +18,7 @@ FROM fact_encounters f
 INNER JOIN dim_date d ON f.date_key = d.date_key
 INNER JOIN dim_specialty s ON f.specialty_key = s.specialty_key
 INNER JOIN dim_encounter_type et ON f.encounter_type_key = et.encounter_type_key
-WHERE d.year = 2024
+WHERE d.year = 2026
 GROUP BY 
     s.specialty_name,
     d.year,
@@ -173,7 +173,7 @@ SELECT
 FROM fact_encounters f
 INNER JOIN dim_date d ON f.date_key = d.date_key
 INNER JOIN dim_specialty s ON f.specialty_key = s.specialty_key
-WHERE d.year = 2024
+WHERE d.year = 2026
     AND f.claim_status IN ('Paid', 'Processing')
 GROUP BY 
     s.specialty_name,
