@@ -293,7 +293,7 @@ Cons:
 fact_encounters:
   - diagnosis_1, diagnosis_2, diagnosis_3 columns
   - procedure_1, procedure_2, procedure_3, procedure_4 columns
-```
+
 
 Pros:
 -  No JOINs needed
