@@ -500,5 +500,5 @@ For analytics workloads where queries vastly outnumber updates, the star schema 
 The costs—storage (+30%), ETL complexity, and 24-hour latency—are acceptable for the benefits gained.
 
 Key Takeaway: Star schema is not a one side fit all. It is great for analytics (OLAP), never for transactions (OLTP).
-The right tool for the right job.
+Using the right tool for the right job.
 
