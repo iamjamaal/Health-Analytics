@@ -30,4 +30,92 @@ A dimensional star schema with:
 
 **Result:** 5-40x faster query execution with simpler SQL.
 
+# Healthcare Analytics Star Schema
+
+> **Transforming normalized OLTP data into an optimized OLAP star schema for healthcare analytics**
+
+A complete data warehousing project demonstrating the design, implementation, and performance optimization of a star schema for healthcare encounter analytics. This project showcases a **15.4x average query performance improvement** over traditional normalized database queries.
+
+---
+
+## 📋 Table of Contents
+
+- [Overview](#overview)
+- [Project Structure](#project-structure)
+- [Key Features](#key-features)
+- [Performance Results](#performance-results)
+- [Database Schema](#database-schema)
+- [ETL Architecture](#etl-architecture)
+- [Business Questions Answered](#business-questions-answered)
+- [Getting Started](#getting-started)
+- [Technologies Used](#technologies-used)
+- [Design Decisions](#design-decisions)
+- [Future Enhancements](#future-enhancements)
+- [License](#license)
+
+---
+
+## 🎯 Overview
+
+This project transforms a normalized healthcare OLTP database into a dimensional star schema optimized for analytical queries. The system tracks patient encounters, diagnoses, procedures, providers, and financial metrics to support healthcare operations analytics.
+
+### Business Context
+
+Healthcare organizations need fast, reliable analytics to answer critical questions:
+- How many patient encounters happen by specialty each month?
+- What are the most common diagnosis-procedure combinations?
+- What is our 30-day readmission rate by specialty?
+- What is our revenue distribution across specialties and time periods?
+
+Traditional normalized databases struggle with these analytical queries due to complex JOINs, runtime date calculations, and lack of pre-computed metrics.
+
+### Solution
+
+A dimensional star schema with:
+- **Pre-computed date attributes** (eliminating DATE_FORMAT overhead)
+- **Pre-aggregated readmission flags** (eliminating expensive self-joins)
+- **Denormalized dimensions** (reducing JOIN complexity)
+- **Optimized indexing** (composite and bitmap indexes)
+- **Partitioning strategy** (date-based partition elimination)
+
+**Result:** 5-40x faster query execution with simpler SQL.
+
+---
+
+## Project Structure
+Health-Analytics/
+│
+├── star_schema.sql # Complete star schema DDL
+│ ├── Dimension tables (8 tables)
+│ ├── Fact table (fact_encounters)
+│ ├── Bridge tables (diagnoses, procedures)
+│ ├── Aggregate fact table
+│ └── Analytical views
+│
+├── etl_design.txt # ETL implementation
+│ ├── ETL control framework
+│ ├── Dimension load procedures
+│ ├── Fact table incremental loads
+│ ├── Readmission calculation logic
+│ └── Error handling & monitoring
+│
+├── query_analytics.txt # OLTP queries & analysis
+│ └── Original normalized queries with performance bottlenecks
+│
+├── star_schema_queries.txt # Optimized star schema queries
+│ └── Rewritten queries with performance comparisons
+│
+├── design_decisions.txt # Architecture decisions
+│ ├── Fact grain justification
+│ ├── Dimension design choices
+│ ├── Bridge table strategy
+│ └── SCD type selection
+│
+└── reflection.md # Comprehensive analysis
+├── Performance quantification
+├── Trade-off analysis
+├── Bridge table justification
+└── Production recommendations
+
+
 
