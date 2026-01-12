@@ -144,6 +144,9 @@ RATIONALE:
 - Adds business rules about encounter types
 - Enables consistent encounter type analysis
 
+
+NB: Other dimension tables used (dim_diagnosis, dim_procedure)
+
 --------------------------------------------------------------------------------------------
 
 
