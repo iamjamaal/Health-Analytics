@@ -214,7 +214,7 @@ Increased Complexity:
 - Monitoring: ETL job scheduling and alerting
 - Debugging: When ETL fails, need specialized skills
 
-**Is it Worth It?
+Is it Worth It?
 - ETL runs once daily (15-30 minutes)
 - Queries run thousands of times daily
 - Verdict:Pay complexity cost once in ETL, reap benefits in all queries
