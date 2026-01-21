@@ -235,4 +235,5 @@ STORAGE TRADE-OFF:
 - Star schema uses ~15-20% more storage (denormalization + indexes)
 - Query performance improved 5-40x
 - ETL complexity increased ~30%
+
 - CONCLUSION: Worth the investment for analytics workload

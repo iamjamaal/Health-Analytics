@@ -26,9 +26,9 @@
 
 - Star Schema Solution:
   - Direct foreign key relationships from fact to dimensions
-- Example: `fact_encounters → dim_specialty` (2 tables, 1 JOIN)
-- Denormalization eliminates intermediate JOINs
-- Specialty name directly accessible via single JOIN
+  - Example: `fact_encounters → dim_specialty` (2 tables, 1 JOIN)
+  - Denormalization eliminates intermediate JOINs
+  - Specialty name directly accessible via single JOIN
 
 Impact: Reduced JOIN count by 30-50% across all queries.
 
@@ -229,7 +229,6 @@ Increased Complexity:
 - Debugging: When ETL fails, need specialized skills
 
 **Is it Worth It?
-
 - ETL runs once daily (15-30 minutes)
 - Queries run thousands of times daily
 - Verdict:Pay complexity cost once in ETL, reap benefits in all queries
@@ -308,10 +307,8 @@ Cons:
 #### Option B: Denormalize All (REJECTED)
 
 fact_encounters:
-
-- diagnosis_1, diagnosis_2, diagnosis_3 columns
-- procedure_1, procedure_2, procedure_3, procedure_4 columns
-
+  - diagnosis_1, diagnosis_2, diagnosis_3 columns
+  - procedure_1, procedure_2, procedure_3, procedure_4 columns
 ```
 
 Pros:
@@ -527,3 +524,4 @@ For analytics workloads where queries vastly outnumber updates, the star schema 
 The costs—storage (+30%), ETL complexity, and 24-hour latency—are acceptable for the benefits gained.
 
 Key Takeaway: Star schema is not a one side fit all. Use it for analytics (OLAP), never for transactions (OLTP). The right tool for the right job.
+
