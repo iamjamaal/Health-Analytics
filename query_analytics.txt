@@ -9,8 +9,8 @@ SELECT
 FROM encounters e
 INNER JOIN providers p ON e.provider_id = p.provider_id
 INNER JOIN specialties s ON p.specialty_id = s.specialty_id
-WHERE e.encounter_date >= '2024-01-01' 
-    AND e.encounter_date < '2025-01-01'
+WHERE e.encounter_date >= '2020-01-01' 
+    AND e.encounter_date < '2021-01-01'
 GROUP BY 
     s.specialty_name,
     DATE_FORMAT(e.encounter_date, '%Y-%m'),
