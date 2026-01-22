@@ -191,7 +191,7 @@ MEASURES TO STORE:
    - NULL for first encounter
 
 JUSTIFICATION:
-- These metrics are used in 80% of analytics queries
+- These metrics are used in most of analytics queries
 - Computing them during ETL (once) vs. every query (thousands of times)
 - Transforms Question 3's expensive self-join into a simple WHERE clause
 - Slightly increases ETL complexity but dramatically improves query performance
@@ -230,12 +230,6 @@ HOW THIS WORKS:
 - Specific queries (Question 2, diagnosis-specific analysis) → JOIN bridge tables
 - Use pre-aggregated counts (diagnosis_count, procedure_count) for simple metrics
 - Use bridge tables only when specific codes are required
-
-ALTERNATIVE CONSIDERED - Denormalize all diagnoses into fact:
-- Would require multiple diagnosis columns (diagnosis_1, diagnosis_2, etc.)
-- Wastes space when encounters have fewer diagnoses than max columns
-- Makes querying specific diagnoses awkward (need to check multiple columns)
-- REJECTED: Bridge table is more flexible
 
 -------------------------------------------------------------------------------------
 
